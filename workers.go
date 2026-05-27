@@ -39,6 +39,7 @@ const (
 	teardownGrace          = 5 * time.Second
 	defaultMaxConcurrency  = 32
 	defaultMaxQueued       = 1024
+	defaultMaxPerCell      = 8
 )
 
 // Result status codes returned by workers_result.
@@ -58,6 +59,7 @@ const (
 	codeDecode      = 3
 	codeFireFailed  = 4
 	codeQueueFull   = 15
+	codeCellFull    = 16
 	codeCapAbsent   = 99
 )
 
@@ -117,6 +119,65 @@ type inflightTask struct {
 }
 
 // ---------------------------------------------------------------------
+// Per-cell task tracker
+// ---------------------------------------------------------------------
+
+// cellTracker enforces a per-cell ceiling on concurrent tasks so that
+// one misbehaving cell cannot consume all global worker slots.
+type cellTracker struct {
+	mu         sync.Mutex
+	inflight   map[string]int // cellID -> count of active tasks (submit + submitFire)
+	maxPerCell int
+}
+
+func newCellTracker(maxPerCell int) *cellTracker {
+	return &cellTracker{
+		inflight:   make(map[string]int),
+		maxPerCell: maxPerCell,
+	}
+}
+
+// acquire increments the cell's counter if under the limit.
+// Returns true if the slot was acquired, false if the cell is full.
+func (ct *cellTracker) acquire(cellID string) bool {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if ct.inflight[cellID] >= ct.maxPerCell {
+		return false
+	}
+	ct.inflight[cellID]++
+	return true
+}
+
+// release decrements the cell's counter by one. Safe to call even if
+// the counter is already zero (clamps to zero).
+func (ct *cellTracker) release(cellID string) {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if ct.inflight[cellID] > 0 {
+		ct.inflight[cellID]--
+	}
+	if ct.inflight[cellID] == 0 {
+		delete(ct.inflight, cellID)
+	}
+}
+
+// dropCell zeroes the cell's counter. Used during per-cell teardown
+// after all in-flight tasks have been cancelled.
+func (ct *cellTracker) dropCell(cellID string) {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	delete(ct.inflight, cellID)
+}
+
+// countForCell returns the current inflight count for the cell.
+func (ct *cellTracker) countForCell(cellID string) int {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	return ct.inflight[cellID]
+}
+
+// ---------------------------------------------------------------------
 // Worker pool
 // ---------------------------------------------------------------------
 
@@ -129,6 +190,8 @@ type workerPool struct {
 	maxConcurrency int
 	maxQueued      int
 
+	cells *cellTracker
+
 	mu       sync.Mutex
 	inflight map[uint32]*inflightTask
 	results  map[uint32]*taskResult
@@ -138,7 +201,7 @@ type workerPool struct {
 	cleanupStop context.CancelFunc
 }
 
-func newWorkerPool(logger *slog.Logger, maxConcurrency, maxQueued int) *workerPool {
+func newWorkerPool(logger *slog.Logger, maxConcurrency, maxQueued, maxPerCell int) *workerPool {
 	ctx, cancel := context.WithCancel(context.Background())
 	// Reuse one transport with a real keep-alive pool. Default
 	// http.Client builds a fresh transport with tiny idle-conn limits —
@@ -160,6 +223,7 @@ func newWorkerPool(logger *slog.Logger, maxConcurrency, maxQueued int) *workerPo
 		sem:            make(chan struct{}, maxConcurrency),
 		maxConcurrency: maxConcurrency,
 		maxQueued:      maxQueued,
+		cells:          newCellTracker(maxPerCell),
 		inflight:       make(map[uint32]*inflightTask),
 		results:        make(map[uint32]*taskResult),
 		cleanupDone:    make(chan struct{}),
@@ -189,6 +253,9 @@ func (p *workerPool) submit(cellID string, req taskRequest) (uint32, uint32) {
 	if p.inflightCount() >= p.maxQueued {
 		return 0, codeQueueFull
 	}
+	if cellID != "" && !p.cells.acquire(cellID) {
+		return 0, codeCellFull
+	}
 
 	// Skip reserved values so task IDs never collide with error codes.
 	var id uint32
@@ -209,6 +276,9 @@ func (p *workerPool) submit(cellID string, req taskRequest) (uint32, uint32) {
 	go func() {
 		defer func() {
 			<-p.sem
+			if cellID != "" {
+				p.cells.release(cellID)
+			}
 			close(task.done)
 		}()
 		defer func() {
@@ -256,10 +326,18 @@ func (p *workerPool) submitFire(cellID string, req taskRequest) uint32 {
 	if p.inflightCount() >= p.maxQueued {
 		return codeQueueFull
 	}
+	if cellID != "" && !p.cells.acquire(cellID) {
+		return codeCellFull
+	}
 
 	p.sem <- struct{}{}
 	go func() {
-		defer func() { <-p.sem }()
+		defer func() {
+			<-p.sem
+			if cellID != "" {
+				p.cells.release(cellID)
+			}
+		}()
 		defer func() {
 			if r := recover(); r != nil {
 				p.logger.Error("fire-and-forget task panicked", "cell", cellID, "type", req.Type, "panic", r)
@@ -378,9 +456,18 @@ func (p *workerPool) teardownCell(cellID string) (int, int) {
 		select {
 		case <-t.done:
 		case <-deadline:
+			// Tasks that didn't finish in time still hold cell slots.
+			// Drop the entire cell counter — those goroutines will
+			// call release() when they eventually exit, and release()
+			// clamps to zero so the extra decrements are harmless.
+			p.cells.dropCell(cellID)
 			return len(tasks), resultsDropped
 		}
 	}
+
+	// All tasks exited cleanly; their defers already called release().
+	// Drop any residual counter (shouldn't be needed, but defensive).
+	p.cells.dropCell(cellID)
 	return len(tasks), resultsDropped
 }
 
@@ -494,10 +581,12 @@ func workersSetup(env ext.SetupEnv) error {
 	}
 	maxConcurrency := readPositiveIntEnv("PULP_WORKERS_MAX_CONCURRENCY", defaultMaxConcurrency)
 	maxQueued := readPositiveIntEnv("PULP_WORKERS_MAX_QUEUED", defaultMaxQueued)
-	pool = newWorkerPool(logger, maxConcurrency, maxQueued)
+	maxPerCell := readPositiveIntEnv("PULP_WORKER_MAX_PER_CELL", defaultMaxPerCell)
+	pool = newWorkerPool(logger, maxConcurrency, maxQueued, maxPerCell)
 	logger.Info("workers extension initialized",
 		"max_concurrency", maxConcurrency,
 		"max_queued", maxQueued,
+		"max_per_cell", maxPerCell,
 	)
 	return nil
 }
