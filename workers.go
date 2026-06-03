@@ -14,12 +14,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/BananaLabs-OSS/Pulp/abi"
@@ -41,6 +43,15 @@ const (
 	defaultMaxQueued       = 1024
 	defaultMaxPerCell      = 8
 )
+
+// maxFetchBytes caps the http.fetch response body buffered in host memory.
+// Without a cap a cell-controlled URL can point at an endpoint streaming
+// gigabytes (or a Content-Length-less attacker server) and OOM the whole
+// Pulp host — multiplied by maxConcurrency simultaneous fetches. 50 MiB
+// mirrors the sibling Pulp-ext-http legacy-fetch cap. Override via
+// PULP_WORKERS_MAX_FETCH_BYTES. A body past the cap surfaces an explicit
+// error rather than silently truncating.
+const defaultMaxFetchBytes int64 = 50 * 1024 * 1024 // 50 MiB
 
 // Result status codes returned by workers_result.
 const (
@@ -177,14 +188,171 @@ func (ct *cellTracker) countForCell(cellID string) int {
 	return ct.inflight[cellID]
 }
 
+// =====================================================================
+// SSRF egress guard
+// =====================================================================
+//
+// http.fetch performs outbound HTTP with a cell-supplied URL, and those
+// URLs are USER-influenced (Evolution forwards customer-supplied datapack /
+// world-restore URLs through cells). Without a guard a hostile or buggy
+// cell could reach the cloud-metadata endpoint (169.254.169.254),
+// localhost, RFC-1918 ranges, or other internal services on the VPS —
+// classic SSRF. This mirrors the guard the sibling Pulp-ext-http ships;
+// this extension re-implements outbound HTTP from scratch so it must carry
+// its own copy.
+//
+// The guard does three things:
+//  1. Scheme allowlist — only http/https (rejects file://, gopher://, …).
+//  2. IP block — at DIAL time it validates the RESOLVED IP against a
+//     deny-list of loopback / link-local / private / ULA / unspecified
+//     ranges. Validating the resolved IP (not the hostname string) defeats
+//     DNS-rebinding: even if a name resolves public at check time and
+//     private at connect time, the dialer sees the real connect IP.
+//  3. Redirect re-validation — http.Client.CheckRedirect re-runs the scheme
+//     check on every hop, and the dialer re-runs the IP check for each hop's
+//     connection, so a redirect to an internal target is refused mid-chain.
+//
+// A genuinely-needed internal host can be allowlisted via the
+// HTTP_FETCH_ALLOW env var (comma-separated host[:port] or CIDR entries),
+// kept consistent with Pulp-ext-http; default is deny-all-private.
+
+var errBlockedTarget = errors.New("ssrf guard: target IP is in a blocked (private/loopback/link-local/metadata) range")
+
+var errBlockedScheme = errors.New("ssrf guard: only http and https schemes are permitted")
+
+// egressGuard decides whether an outbound request may proceed. It is
+// constructed once per pool from the HTTP_FETCH_ALLOW env var.
+type egressGuard struct {
+	allowHosts map[string]struct{}
+	allowNets  []*net.IPNet
+}
+
+// newEgressGuard parses HTTP_FETCH_ALLOW into an egressGuard. Entries are
+// comma-separated; an entry containing "/" is parsed as a CIDR, otherwise
+// it's a literal host (optionally host:port). Malformed/empty entries are
+// skipped.
+func newEgressGuard(allowList string) *egressGuard {
+	g := &egressGuard{allowHosts: map[string]struct{}{}}
+	for _, raw := range strings.Split(allowList, ",") {
+		entry := strings.TrimSpace(raw)
+		if entry == "" {
+			continue
+		}
+		if strings.Contains(entry, "/") {
+			if _, ipnet, err := net.ParseCIDR(entry); err == nil {
+				g.allowNets = append(g.allowNets, ipnet)
+			}
+			continue
+		}
+		g.allowHosts[strings.ToLower(entry)] = struct{}{}
+	}
+	return g
+}
+
+// hostAllowed reports whether host (the URL host, optionally host:port) is
+// on the explicit allowlist and therefore exempt from the IP block.
+func (g *egressGuard) hostAllowed(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if _, ok := g.allowHosts[host]; ok {
+		return true
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		if _, ok := g.allowHosts[h]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// ipAllowed reports whether ip is inside one of the explicitly-allowed CIDRs.
+func (g *egressGuard) ipAllowed(ip net.IP) bool {
+	for _, n := range g.allowNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// ipBlocked reports whether ip falls in a range a cell must not reach.
+// Covers loopback, link-local (incl. 169.254.169.254 cloud metadata),
+// RFC-1918 / ULA private, unspecified, and other non-global-unicast
+// addresses (multicast, etc.).
+func ipBlocked(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if ip.IsLoopback() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsInterfaceLocalMulticast() ||
+		ip.IsMulticast() ||
+		ip.IsUnspecified() ||
+		ip.IsPrivate() { // RFC-1918 + ULA (fc00::/7)
+		return true
+	}
+	return false
+}
+
+// dialControl is the net.Dialer.Control hook. It runs AFTER name resolution,
+// once per resolved address the dialer attempts, with the concrete IP:port
+// it is about to connect to. Returning an error aborts that connection — so
+// DNS-rebinding (resolve-to-public, connect-to-private) cannot slip past.
+func (g *egressGuard) dialControl(_ string, address string, _ syscall.RawConn) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		host = address
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return errBlockedTarget
+	}
+	if g.ipAllowed(ip) {
+		return nil
+	}
+	if ipBlocked(ip) {
+		return fmt.Errorf("%w: %s", errBlockedTarget, ip.String())
+	}
+	return nil
+}
+
+// dialContext wraps net.Dialer.DialContext and decides the name-allowlist
+// exemption PER DIAL, keyed on the host:port actually being connected to
+// (`address`). On a redirect, http.Transport passes the redirect target's
+// host here — so the exemption is never pinned to the request context and
+// cannot ride a 302 from an allowlisted host to an internal target. Each
+// hop earns (or is denied) its own exemption.
+func (g *egressGuard) dialContext(base func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
+	exempt := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		if g.hostAllowed(address) {
+			return exempt.DialContext(ctx, network, address)
+		}
+		return base(ctx, network, address)
+	}
+}
+
+// checkScheme validates the request URL's scheme. Run for the initial
+// request and re-run for every redirect hop via CheckRedirect.
+func (g *egressGuard) checkScheme(req *http.Request) error {
+	switch strings.ToLower(req.URL.Scheme) {
+	case "http", "https":
+		return nil
+	default:
+		return fmt.Errorf("%w: got %q", errBlockedScheme, req.URL.Scheme)
+	}
+}
+
 // ---------------------------------------------------------------------
 // Worker pool
 // ---------------------------------------------------------------------
 
 type workerPool struct {
-	logger *slog.Logger
-	client *http.Client
-	nextID atomic.Uint32
+	logger       *slog.Logger
+	client       *http.Client
+	guard        *egressGuard
+	maxFetchBytes int64
+	nextID       atomic.Uint32
 
 	sem            chan struct{}
 	maxConcurrency int
@@ -201,14 +369,26 @@ type workerPool struct {
 	cleanupStop context.CancelFunc
 }
 
-func newWorkerPool(logger *slog.Logger, maxConcurrency, maxQueued, maxPerCell int) *workerPool {
+func newWorkerPool(logger *slog.Logger, maxConcurrency, maxQueued, maxPerCell int, maxFetchBytes int64) *workerPool {
 	ctx, cancel := context.WithCancel(context.Background())
 	// Reuse one transport with a real keep-alive pool. Default
 	// http.Client builds a fresh transport with tiny idle-conn limits —
 	// every Bananagine/Resend call pays a TCP (and TLS for Resend)
 	// handshake. A per-host idle pool collapses that to one handshake
 	// per host across the process lifetime.
+	//
+	// DialContext uses a net.Dialer whose Control hook runs AFTER DNS
+	// resolution with the concrete IP about to be dialed — the SSRF egress
+	// guard. Checking the resolved IP (not the hostname) defeats DNS
+	// rebinding. See egressGuard above.
+	guard := newEgressGuard(os.Getenv("HTTP_FETCH_ALLOW"))
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control:   guard.dialControl,
+	}
 	transport := &http.Transport{
+		DialContext:           guard.dialContext(dialer.DialContext),
 		MaxIdleConns:          128,
 		MaxIdleConnsPerHost:   32,
 		MaxConnsPerHost:       64,
@@ -218,8 +398,19 @@ func newWorkerPool(logger *slog.Logger, maxConcurrency, maxQueued, maxPerCell in
 		ForceAttemptHTTP2:     true,
 	}
 	p := &workerPool{
-		logger:         logger,
-		client:         &http.Client{Timeout: defaultFetchTimeout, Transport: transport},
+		logger: logger,
+		client: &http.Client{
+			Timeout:   defaultFetchTimeout,
+			Transport: transport,
+			// Re-validate the scheme on every redirect hop; the IP block is
+			// enforced by the dialer Control hook on each hop's connection,
+			// so a redirect to an internal target is refused at dial time.
+			CheckRedirect: func(req *http.Request, _ []*http.Request) error {
+				return guard.checkScheme(req)
+			},
+		},
+		guard:         guard,
+		maxFetchBytes: maxFetchBytes,
 		sem:            make(chan struct{}, maxConcurrency),
 		maxConcurrency: maxConcurrency,
 		maxQueued:      maxQueued,
@@ -361,11 +552,21 @@ func (p *workerPool) submitFire(cellID string, req taskRequest) uint32 {
 // statusComplete the data is a msgpack-encoded abi.HTTPResponse. On
 // statusError or statusPanic the data is a raw UTF-8 error string —
 // the cell-side wrapper surfaces it via TaskResult.Error.
-func (p *workerPool) result(id uint32) ([]byte, uint32) {
+//
+// cellID scopes ownership: a cell may only poll its OWN tasks. Task IDs are
+// a global, sequential, enumerable counter, so without this check a hostile
+// sibling could sweep IDs and steal (and delete) another cell's result. A
+// mismatch is reported as statusUnknown — indistinguishable from a
+// never-submitted ID, leaking nothing. Single-cell deployments (cellID=="")
+// own the matching "" tasks, so they are unaffected.
+func (p *workerPool) result(cellID string, id uint32) ([]byte, uint32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if r, ok := p.results[id]; ok {
+		if r.cellID != cellID {
+			return nil, statusUnknown
+		}
 		// Only consume the result on terminal statuses — keeps polling
 		// idempotent for any non-terminal snapshot that somehow lands
 		// here (shouldn't happen today, but cheap insurance).
@@ -374,19 +575,28 @@ func (p *workerPool) result(id uint32) ([]byte, uint32) {
 		}
 		return r.data, r.status
 	}
-	if _, ok := p.inflight[id]; ok {
+	if t, ok := p.inflight[id]; ok {
+		if t.cellID != cellID {
+			return nil, statusUnknown
+		}
 		return nil, statusPending
 	}
 	return nil, statusUnknown
 }
 
-// cancel attempts to cancel an in-flight task.
-func (p *workerPool) cancel(id uint32) uint32 {
+// cancel attempts to cancel an in-flight task owned by cellID. A cell may
+// only cancel its OWN tasks — a cross-cell cancel would be a DoS against a
+// sibling's in-flight work. A mismatch (or missing id) returns 1 (not
+// found), same as an already-done task.
+func (p *workerPool) cancel(cellID string, id uint32) uint32 {
 	p.mu.Lock()
 	task, ok := p.inflight[id]
+	if ok && task.cellID != cellID {
+		ok = false
+	}
 	p.mu.Unlock()
 	if !ok {
-		return 1 // not found or already done
+		return 1 // not found, already done, or not owned by this cell
 	}
 	task.cancel()
 	return 0
@@ -531,15 +741,31 @@ func (p *workerPool) doHTTPFetch(ctx context.Context, req taskRequest) ([]byte, 
 		httpReq.Header.Set(k, v)
 	}
 
+	// Scheme allowlist (http/https only) before any dial. The resolved-IP
+	// block is enforced by the dialer Control hook; redirects re-check both.
+	if err := p.guard.checkScheme(httpReq); err != nil {
+		return nil, err
+	}
+
 	resp, err := p.client.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("do request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	// Bounded read — without a cap a cell-controlled URL pointing at a
+	// gigabyte stream (or a Content-Length-less peer) buffers the whole body
+	// in host memory and, ×maxConcurrency, OOMs the Pulp host. Past the cap
+	// we surface an explicit error rather than silently truncating.
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, p.maxFetchBytes))
 	if err != nil {
 		return nil, fmt.Errorf("read response body: %w", err)
+	}
+	if int64(len(respBody)) == p.maxFetchBytes {
+		var probe [1]byte
+		if n, _ := resp.Body.Read(probe[:]); n > 0 {
+			return nil, fmt.Errorf("response body exceeds %d bytes", p.maxFetchBytes)
+		}
 	}
 
 	headers := map[string]string{}
@@ -582,11 +808,13 @@ func workersSetup(env ext.SetupEnv) error {
 	maxConcurrency := readPositiveIntEnv("PULP_WORKERS_MAX_CONCURRENCY", defaultMaxConcurrency)
 	maxQueued := readPositiveIntEnv("PULP_WORKERS_MAX_QUEUED", defaultMaxQueued)
 	maxPerCell := readPositiveIntEnv("PULP_WORKER_MAX_PER_CELL", defaultMaxPerCell)
-	pool = newWorkerPool(logger, maxConcurrency, maxQueued, maxPerCell)
+	maxFetchBytes := int64(readPositiveIntEnv("PULP_WORKERS_MAX_FETCH_BYTES", int(defaultMaxFetchBytes)))
+	pool = newWorkerPool(logger, maxConcurrency, maxQueued, maxPerCell, maxFetchBytes)
 	logger.Info("workers extension initialized",
 		"max_concurrency", maxConcurrency,
 		"max_queued", maxQueued,
 		"max_per_cell", maxPerCell,
+		"max_fetch_bytes", maxFetchBytes,
 	)
 	return nil
 }
@@ -674,7 +902,7 @@ func workersRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 	// workers_result(task_id, result_ptr_out, result_len_out) -> status:uint32
 	b.NewFunctionBuilder().
 		WithFunc(func(ctx context.Context, m api.Module, taskID, resultPtrOut, resultLenOut uint32) uint32 {
-			data, status := pool.result(taskID)
+			data, status := pool.result(cellID, taskID)
 			if status == statusPending || status == statusUnknown {
 				return status
 			}
@@ -718,7 +946,7 @@ func workersRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 	// workers_cancel(task_id) -> error_code:uint32
 	b.NewFunctionBuilder().
 		WithFunc(func(_ context.Context, _ api.Module, taskID uint32) uint32 {
-			return pool.cancel(taskID)
+			return pool.cancel(cellID, taskID)
 		}).
 		Export("workers_cancel")
 
