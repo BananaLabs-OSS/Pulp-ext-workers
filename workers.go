@@ -47,11 +47,16 @@ const (
 // maxFetchBytes caps the http.fetch response body buffered in host memory.
 // Without a cap a cell-controlled URL can point at an endpoint streaming
 // gigabytes (or a Content-Length-less attacker server) and OOM the whole
-// Pulp host — multiplied by maxConcurrency simultaneous fetches. 50 MiB
-// mirrors the sibling Pulp-ext-http legacy-fetch cap. Override via
+// Pulp host — multiplied by maxConcurrency simultaneous fetches. The cap is
+// sized to admit the largest legitimate transfer this fetcher carries:
+// Evolution's world-archive/backup download (Evolution/pulp-cell/poller.go
+// notes "game worlds cap at ~10GB"), routed through workers http.fetch since
+// the mutex-deadlock refactor. 16 GiB leaves headroom over that ~10 GB
+// ceiling while still bounding a truly-unbounded / Content-Length-less
+// hostile body so it cannot OOM the host. Override via
 // PULP_WORKERS_MAX_FETCH_BYTES. A body past the cap surfaces an explicit
 // error rather than silently truncating.
-const defaultMaxFetchBytes int64 = 50 * 1024 * 1024 // 50 MiB
+const defaultMaxFetchBytes int64 = 16 * 1024 * 1024 * 1024 // 16 GiB
 
 // Result status codes returned by workers_result.
 const (
@@ -800,6 +805,20 @@ func readPositiveIntEnv(name string, def int) int {
 	return n
 }
 
+// readPositiveInt64Env reads an env var as a positive int64, falling back to
+// def. Used for byte-size caps whose default exceeds a 32-bit int range.
+func readPositiveInt64Env(name string, def int64) int64 {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n
+}
+
 func workersSetup(env ext.SetupEnv) error {
 	logger := env.Logger
 	if logger == nil {
@@ -808,7 +827,7 @@ func workersSetup(env ext.SetupEnv) error {
 	maxConcurrency := readPositiveIntEnv("PULP_WORKERS_MAX_CONCURRENCY", defaultMaxConcurrency)
 	maxQueued := readPositiveIntEnv("PULP_WORKERS_MAX_QUEUED", defaultMaxQueued)
 	maxPerCell := readPositiveIntEnv("PULP_WORKER_MAX_PER_CELL", defaultMaxPerCell)
-	maxFetchBytes := int64(readPositiveIntEnv("PULP_WORKERS_MAX_FETCH_BYTES", int(defaultMaxFetchBytes)))
+	maxFetchBytes := readPositiveInt64Env("PULP_WORKERS_MAX_FETCH_BYTES", defaultMaxFetchBytes)
 	pool = newWorkerPool(logger, maxConcurrency, maxQueued, maxPerCell, maxFetchBytes)
 	logger.Info("workers extension initialized",
 		"max_concurrency", maxConcurrency,
