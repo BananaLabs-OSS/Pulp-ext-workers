@@ -37,6 +37,7 @@ import (
 
 const (
 	defaultFetchTimeout    = 30 * time.Second
+	maxFetchTimeout        = 300 * time.Second // upper bound when no timeout_ms is set
 	resultTTL              = 5 * time.Minute
 	teardownGrace          = 5 * time.Second
 	defaultMaxConcurrency  = 32
@@ -76,8 +77,13 @@ const (
 	codeFireFailed  = 4
 	codeQueueFull   = 15
 	codeCellFull    = 16
+	codeSaturated   = 17
 	codeCapAbsent   = 99
 )
+
+// ErrWorkerSaturated is returned when the concurrency semaphore is full and
+// the submit call would block the WASM host import indefinitely.
+var ErrWorkerSaturated = errors.New("worker pool saturated: all concurrency slots in use")
 
 // ---------------------------------------------------------------------
 // Module-level state
@@ -405,7 +411,11 @@ func newWorkerPool(logger *slog.Logger, maxConcurrency, maxQueued, maxPerCell in
 	p := &workerPool{
 		logger: logger,
 		client: &http.Client{
-			Timeout:   defaultFetchTimeout,
+			// No global Timeout: each task sets its own deadline via the
+			// request context (runTask wraps in context.WithTimeout using
+			// req.TimeoutMs, falling back to maxFetchTimeout). A hard client
+			// Timeout of 30 s would silently truncate any task with
+			// timeout_ms > 30 000, ignoring the cell's explicit request.
 			Transport: transport,
 			// Re-validate the scheme on every redirect hop; the IP block is
 			// enforced by the dialer Control hook on each hop's connection,
@@ -468,7 +478,20 @@ func (p *workerPool) submit(cellID string, req taskRequest) (uint32, uint32) {
 	p.inflight[id] = task
 	p.mu.Unlock()
 
-	p.sem <- struct{}{}
+	select {
+	case p.sem <- struct{}{}:
+	default:
+		// All concurrency slots are occupied. Reject immediately so the
+		// WASM host import returns rather than blocking the caller indefinitely.
+		p.mu.Lock()
+		delete(p.inflight, id)
+		p.mu.Unlock()
+		task.cancel()
+		if cellID != "" {
+			p.cells.release(cellID)
+		}
+		return 0, codeSaturated
+	}
 	go func() {
 		defer func() {
 			<-p.sem
@@ -526,7 +549,14 @@ func (p *workerPool) submitFire(cellID string, req taskRequest) uint32 {
 		return codeCellFull
 	}
 
-	p.sem <- struct{}{}
+	select {
+	case p.sem <- struct{}{}:
+	default:
+		if cellID != "" {
+			p.cells.release(cellID)
+		}
+		return codeSaturated
+	}
 	go func() {
 		defer func() {
 			<-p.sem
@@ -540,11 +570,7 @@ func (p *workerPool) submitFire(cellID string, req taskRequest) uint32 {
 			}
 		}()
 
-		timeout := defaultFetchTimeout
-		if req.TimeoutMs > 0 {
-			timeout = time.Duration(req.TimeoutMs) * time.Millisecond
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		ctx, cancel := context.WithTimeout(context.Background(), maxFetchTimeout)
 		defer cancel()
 		if _, err := p.runTask(ctx, req); err != nil {
 			p.logger.Warn("fire-and-forget task failed", "cell", cellID, "type", req.Type, "err", err)
@@ -710,11 +736,13 @@ func (p *workerPool) cleanupLoop(ctx context.Context) {
 
 // runTask dispatches to the appropriate task handler based on type.
 func (p *workerPool) runTask(ctx context.Context, req taskRequest) ([]byte, error) {
+	timeout := maxFetchTimeout
 	if req.TimeoutMs > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, time.Duration(req.TimeoutMs)*time.Millisecond)
-		defer cancel()
+		timeout = time.Duration(req.TimeoutMs) * time.Millisecond
 	}
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithTimeout(ctx, timeout)
+	defer cancel()
 	switch req.Type {
 	case "http.fetch":
 		return p.doHTTPFetch(ctx, req)
