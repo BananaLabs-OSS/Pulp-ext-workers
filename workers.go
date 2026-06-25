@@ -467,6 +467,9 @@ func (p *workerPool) submitFire(cellID string, req taskRequest) uint32 {
 // mismatch is reported as statusUnknown — indistinguishable from a
 // never-submitted ID, leaking nothing. Single-cell deployments (cellID=="")
 // own the matching "" tasks, so they are unaffected.
+// result peeks at the completed result for id without removing it from the
+// map. The caller must call consume(id) after successfully writing the data
+// into WASM memory so that a failed alloc never silently drops the result.
 func (p *workerPool) result(cellID string, id uint32) ([]byte, uint32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -474,12 +477,6 @@ func (p *workerPool) result(cellID string, id uint32) ([]byte, uint32) {
 	if r, ok := p.results[id]; ok {
 		if r.cellID != cellID {
 			return nil, statusUnknown
-		}
-		// Only consume the result on terminal statuses — keeps polling
-		// idempotent for any non-terminal snapshot that somehow lands
-		// here (shouldn't happen today, but cheap insurance).
-		if r.status == statusComplete || r.status == statusError || r.status == statusPanic {
-			delete(p.results, id)
 		}
 		return r.data, r.status
 	}
@@ -490,6 +487,15 @@ func (p *workerPool) result(cellID string, id uint32) ([]byte, uint32) {
 		return nil, statusPending
 	}
 	return nil, statusUnknown
+}
+
+// consume removes the completed result for id from the map. Must be called
+// only after the WASM memory write succeeds; leaving the result in the map
+// until then lets the cell retry if alloc fails.
+func (p *workerPool) consume(id uint32) {
+	p.mu.Lock()
+	delete(p.results, id)
+	p.mu.Unlock()
 }
 
 // cancel attempts to cancel an in-flight task owned by cellID. A cell may
@@ -843,6 +849,8 @@ func workersRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 
 			// Write data into WASM memory via pulp_alloc.
 			if len(data) == 0 {
+				// Nothing to write; consume before returning so the slot is freed.
+				pool.consume(taskID)
 				if !m.Memory().WriteUint32Le(resultPtrOut, 0) {
 					return status
 				}
@@ -854,19 +862,25 @@ func workersRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 
 			allocFn := m.ExportedFunction("pulp_alloc")
 			if allocFn == nil {
+				// Alloc unavailable; leave result in map so the cell can retry.
 				return status
 			}
 			results, err := allocFn.Call(ctx, uint64(len(data)))
 			if err != nil || len(results) == 0 {
+				// Alloc failed; leave result in map so the cell can retry.
 				return status
 			}
 			ptr := uint32(results[0])
 			if ptr == 0 {
+				// Alloc returned null; leave result in map so the cell can retry.
 				return status
 			}
 			if !m.Memory().Write(ptr, data) {
+				// Write failed; leave result in map so the cell can retry.
 				return status
 			}
+			// Write succeeded — now safe to consume the result.
+			pool.consume(taskID)
 			if !m.Memory().WriteUint32Le(resultPtrOut, ptr) {
 				return status
 			}
