@@ -11,24 +11,26 @@ import (
 	"time"
 
 	"github.com/BananaLabs-OSS/Pulp/abi"
+	"github.com/BananaLabs-OSS/Pulp/ssrfguard"
 )
 
 // newTestPool builds a pool with the given egress allowlist, bypassing the
-// env-derived guard. Passing "" yields a default deny-all-private guard so
-// the SSRF block paths can be exercised against a loopback httptest server.
+// env-derived guard. Passing "" yields a default deny-all-private guard (no
+// seed hosts) so the SSRF block paths can be exercised against a loopback
+// httptest server.
 func newTestPool(t *testing.T, allow string) *workerPool {
 	t.Helper()
 	p := newWorkerPool(slog.Default(), defaultMaxConcurrency, defaultMaxQueued, defaultMaxPerCell, defaultMaxFetchBytes)
 	t.Cleanup(p.teardown)
 
-	guard := newEgressGuard(allow)
-	dialer := &net.Dialer{Control: guard.dialControl}
+	guard := ssrfguard.NewEgressGuard(allow, nil)
+	dialer := &net.Dialer{Control: guard.DialControl}
 	p.guard = guard
 	p.client.Transport = &http.Transport{
-		DialContext: guard.dialContext(dialer.DialContext),
+		DialContext: guard.DialContext(dialer.DialContext),
 	}
 	p.client.CheckRedirect = func(req *http.Request, _ []*http.Request) error {
-		return guard.checkScheme(req)
+		return guard.CheckScheme(req)
 	}
 	return p
 }
@@ -56,30 +58,6 @@ func (p *workerPool) fetchSync(t *testing.T, cellID, url string) ([]byte, uint32
 // ---------------------------------------------------------------------
 // SSRF egress guard
 // ---------------------------------------------------------------------
-
-func TestIPBlocked_Ranges(t *testing.T) {
-	blocked := []string{
-		"127.0.0.1",       // loopback
-		"::1",             // loopback v6
-		"169.254.169.254", // cloud metadata (link-local)
-		"10.1.2.3",        // RFC-1918
-		"172.16.0.1",      // RFC-1918
-		"192.168.1.1",     // RFC-1918
-		"fc00::1",         // ULA
-		"0.0.0.0",         // unspecified
-	}
-	for _, s := range blocked {
-		if !ipBlocked(net.ParseIP(s)) {
-			t.Errorf("ipBlocked(%s) = false, want true", s)
-		}
-	}
-	public := []string{"1.1.1.1", "8.8.8.8", "93.184.216.34", "2606:4700:4700::1111"}
-	for _, s := range public {
-		if ipBlocked(net.ParseIP(s)) {
-			t.Errorf("ipBlocked(%s) = true, want false (public)", s)
-		}
-	}
-}
 
 // TestSSRF_BlocksPrivate confirms a default (no-allowlist) pool refuses to
 // reach a loopback httptest server — the metadata/localhost/RFC-1918 SSRF
