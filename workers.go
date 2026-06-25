@@ -731,7 +731,13 @@ func workersSetup(env ext.SetupEnv) error {
 	}
 	maxConcurrency := readPositiveIntEnv("PULP_WORKERS_MAX_CONCURRENCY", defaultMaxConcurrency)
 	maxQueued := readPositiveIntEnv("PULP_WORKERS_MAX_QUEUED", defaultMaxQueued)
-	maxPerCell := readPositiveIntEnv("PULP_WORKER_MAX_PER_CELL", defaultMaxPerCell)
+	// Accept the new canonical name first; fall back to the legacy singular
+	// spelling ("PULP_WORKER_MAX_PER_CELL") so existing deployments aren't
+	// silently broken on upgrade.
+	maxPerCell := readPositiveIntEnv("PULP_WORKERS_MAX_PER_CELL", 0)
+	if maxPerCell == 0 {
+		maxPerCell = readPositiveIntEnv("PULP_WORKER_MAX_PER_CELL", defaultMaxPerCell)
+	}
 	maxFetchBytes := readPositiveInt64Env("PULP_WORKERS_MAX_FETCH_BYTES", defaultMaxFetchBytes)
 	pool = newWorkerPool(logger, maxConcurrency, maxQueued, maxPerCell, maxFetchBytes)
 	logger.Info("workers extension initialized",
