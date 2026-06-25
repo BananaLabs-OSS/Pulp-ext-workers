@@ -651,9 +651,13 @@ func (p *workerPool) doHTTPFetch(ctx context.Context, req taskRequest) ([]byte, 
 		httpReq.Header.Set(k, v)
 	}
 
-	// Scheme allowlist (http/https only) before any dial. The resolved-IP
-	// block is enforced by the dialer Control hook; redirects re-check both.
-	if err := p.guard.CheckScheme(httpReq); err != nil {
+	// Scheme allowlist (http/https only) before any dial. Use guard.Prepare
+	// (the canonical pre-flight entry point, consistent with ext-http) rather
+	// than guard.CheckScheme directly; Prepare is the extension hook if the
+	// guard ever gains pre-flight mutation. The resolved-IP block and redirect
+	// re-validation are enforced by the dialer Control/DialContext hooks.
+	httpReq, err = p.guard.Prepare(httpReq)
+	if err != nil {
 		return nil, err
 	}
 
