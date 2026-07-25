@@ -10,6 +10,7 @@ package workersext
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,13 +38,13 @@ import (
 // ---------------------------------------------------------------------
 
 const (
-	defaultFetchTimeout    = 30 * time.Second
-	maxFetchTimeout        = 300 * time.Second // upper bound when no timeout_ms is set
-	resultTTL              = 5 * time.Minute
-	teardownGrace          = 5 * time.Second
-	defaultMaxConcurrency  = 32
-	defaultMaxQueued       = 1024
-	defaultMaxPerCell      = 8
+	defaultFetchTimeout   = 30 * time.Second
+	maxFetchTimeout       = 300 * time.Second // upper bound when no timeout_ms is set
+	resultTTL             = 5 * time.Minute
+	teardownGrace         = 5 * time.Second
+	defaultMaxConcurrency = 32
+	defaultMaxQueued      = 1024
+	defaultMaxPerCell     = 8
 )
 
 // maxFetchBytes caps the http.fetch response body buffered in host memory.
@@ -70,15 +72,17 @@ const (
 
 // Host error codes for workers_submit / workers_submit_fire.
 const (
-	codeOK          = 0
-	codeEmptyReq    = 1
-	codeMemRead     = 2
-	codeDecode      = 3
-	codeFireFailed  = 4
-	codeQueueFull   = 15
-	codeCellFull    = 16
-	codeSaturated   = 17
-	codeCapAbsent   = 99
+	codeOK         = 0
+	codeEmptyReq   = 1
+	codeMemRead    = 2
+	codeDecode     = 3
+	codeFireFailed = 4
+	codeQueueFull  = 15
+	codeCellFull   = 16
+	codeSaturated  = 17
+	// codeIdempotencyConflict means a scope reused a key for different work.
+	codeIdempotencyConflict = 18
+	codeCapAbsent           = 99
 )
 
 // ErrWorkerSaturated is returned when the concurrency semaphore is full and
@@ -86,10 +90,79 @@ const (
 var ErrWorkerSaturated = errors.New("worker pool saturated: all concurrency slots in use")
 
 // ---------------------------------------------------------------------
-// Module-level state
+// Host-shared module state
 // ---------------------------------------------------------------------
 
-var pool *workerPool
+// workersHost owns the one process-level worker implementation. Pulp calls a
+// capability's Setup and Teardown once per application, but Teardown carries
+// no application scope; replacing or stopping a pool there would let one
+// application kill another application's jobs. Mutable task state inside the
+// pool is already keyed by ext.Scope, so sharing the implementation is safe.
+var workersHost = struct {
+	mu       sync.RWMutex
+	pool     *workerPool
+	owners   map[ext.Scope]struct{}
+	runtimes map[workerApplicationKey]workerApplicationRuntime
+}{owners: make(map[ext.Scope]struct{}), runtimes: make(map[workerApplicationKey]workerApplicationRuntime)}
+
+type workerApplicationKey struct {
+	id       string
+	instance string
+}
+
+type workerApplicationRuntime struct {
+	storageRoot string
+}
+
+func applicationKey(scope ext.Scope) workerApplicationKey {
+	return workerApplicationKey{id: scope.ApplicationID(), instance: scope.ApplicationInstanceID()}
+}
+
+func sharedWorkerPool() *workerPool {
+	workersHost.mu.RLock()
+	p := workersHost.pool
+	workersHost.mu.RUnlock()
+	return p
+}
+
+func setupSharedWorkerPool(env ext.SetupEnv, newPool func() *workerPool) (p *workerPool, created bool) {
+	scope := env.EffectiveScope()
+	workersHost.mu.Lock()
+	defer workersHost.mu.Unlock()
+	if workersHost.pool == nil {
+		workersHost.pool = newPool()
+		created = true
+	}
+	workersHost.owners[scope] = struct{}{}
+	workersHost.runtimes[applicationKey(scope)] = workerApplicationRuntime{storageRoot: env.StorageRoot}
+	return workersHost.pool, created
+}
+
+func teardownSharedWorkerPool(scope ext.Scope) (p *workerPool, lastOwner bool, owned bool) {
+	workersHost.mu.Lock()
+	p = workersHost.pool
+	if _, owned = workersHost.owners[scope]; !owned {
+		workersHost.mu.Unlock()
+		return p, false, false
+	}
+	delete(workersHost.owners, scope)
+	delete(workersHost.runtimes, applicationKey(scope))
+	lastOwner = len(workersHost.owners) == 0
+	if lastOwner {
+		// Detach before stopping so a concurrent new application setup receives
+		// a fresh pool instead of attaching work to a pool being torn down.
+		workersHost.pool = nil
+	}
+	workersHost.mu.Unlock()
+	return p, lastOwner, true
+}
+
+func workersStorageRoot(scope ext.Scope) (string, bool) {
+	workersHost.mu.RLock()
+	runtime, ok := workersHost.runtimes[applicationKey(scope)]
+	workersHost.mu.RUnlock()
+	return runtime.storageRoot, ok && strings.TrimSpace(runtime.storageRoot) != ""
+}
 
 // ---------------------------------------------------------------------
 // init — register the workers capability
@@ -97,12 +170,12 @@ var pool *workerPool
 
 func init() {
 	ext.Register(ext.Capability{
-		Name:         "workers",
-		Register:     workersRegister,
-		Stub:         workersStub,
-		Setup:        workersSetup,
-		Teardown:     workersTeardown,
-		TeardownCell: workersTeardownCell,
+		Name:          "workers",
+		Register:      workersRegister,
+		Stub:          workersStub,
+		Setup:         workersSetup,
+		TeardownScope: workersTeardownScope,
+		TeardownCell:  workersTeardownCell,
 	})
 }
 
@@ -117,6 +190,70 @@ type taskRequest struct {
 	Headers   map[string]string `msgpack:"headers"`
 	Body      []byte            `msgpack:"body"`
 	TimeoutMs uint32            `msgpack:"timeout_ms"`
+	// IdempotencyKey makes a retry of the same request return its original
+	// task ID while that task is in flight or awaiting its result. It is scoped
+	// to the application/cell instance that submitted it, never process-wide.
+	// Empty retains the legacy submit-on-every-call behaviour.
+	IdempotencyKey string `msgpack:"idempotency_key,omitempty"`
+}
+
+func scopeLogAttrs(scope ext.Scope) []any {
+	return []any{
+		"application", scope.ApplicationID(),
+		"application_instance", scope.ApplicationInstanceID(),
+		"cell", scope.CellID(),
+		"cell_instance", scope.CellInstanceID(),
+	}
+}
+
+type idempotencyEntry struct {
+	id          uint32
+	fingerprint [sha256.Size]byte
+	// completed is zero while the task is still running. Once set, data/status
+	// retain the terminal outcome for resultTTL so a retry after the original
+	// caller consumed its result cannot accidentally repeat an effect.
+	completed time.Time
+	data      []byte
+	status    uint32
+}
+
+type scopedIdempotencyKey struct {
+	scope ext.Scope
+	key   string
+}
+
+func requestFingerprint(req taskRequest) [sha256.Size]byte {
+	// A deterministic fingerprint rejects accidental key reuse for different
+	// effects. Header maps are sorted so equivalent requests hash identically.
+	h := sha256.New()
+	_, _ = h.Write([]byte(req.Type))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(req.Method))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(req.URL))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write(req.Body)
+	_, _ = h.Write([]byte{0})
+	var timeout [4]byte
+	timeout[0] = byte(req.TimeoutMs >> 24)
+	timeout[1] = byte(req.TimeoutMs >> 16)
+	timeout[2] = byte(req.TimeoutMs >> 8)
+	timeout[3] = byte(req.TimeoutMs)
+	_, _ = h.Write(timeout[:])
+	keys := make([]string, 0, len(req.Headers))
+	for key := range req.Headers {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(key))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte(req.Headers[key]))
+	}
+	var sum [sha256.Size]byte
+	copy(sum[:], h.Sum(nil))
+	return sum
 }
 
 // ---------------------------------------------------------------------
@@ -124,10 +261,11 @@ type taskRequest struct {
 // ---------------------------------------------------------------------
 
 type taskResult struct {
-	data      []byte // payload: msgpack abi.HTTPResponse on complete; raw error string on error/panic
-	status    uint32 // statusComplete, statusError, or statusPanic
-	completed time.Time
-	cellID    string // owning cell (for per-cell teardown)
+	data           []byte // payload: msgpack abi.HTTPResponse on complete; raw error string on error/panic
+	status         uint32 // statusComplete, statusError, or statusPanic
+	completed      time.Time
+	scope          ext.Scope // owning application/instance/cell
+	idempotencyKey string
 }
 
 // ---------------------------------------------------------------------
@@ -135,68 +273,71 @@ type taskResult struct {
 // ---------------------------------------------------------------------
 
 type inflightTask struct {
-	cancel context.CancelFunc
-	done   chan struct{}
-	cellID string // owning cell (for per-cell teardown)
+	cancel         context.CancelFunc
+	done           chan struct{}
+	scope          ext.Scope // owning application/instance/cell
+	idempotencyKey string
 }
 
 // ---------------------------------------------------------------------
-// Per-cell task tracker
+// Per-scope task tracker
 // ---------------------------------------------------------------------
 
-// cellTracker enforces a per-cell ceiling on concurrent tasks so that
-// one misbehaving cell cannot consume all global worker slots.
-type cellTracker struct {
+// scopeTracker enforces a per-cell-instance ceiling on concurrent tasks so
+// one misbehaving cell cannot consume all global worker slots. The complete
+// application/instance/cell tuple matters: names such as "api" may repeat in
+// different Pulp applications sharing this process.
+type scopeTracker struct {
 	mu         sync.Mutex
-	inflight   map[string]int // cellID -> count of active tasks (submit + submitFire)
+	inflight   map[ext.Scope]int // scope -> count of active tasks (submit + submitFire)
 	maxPerCell int
 }
 
-func newCellTracker(maxPerCell int) *cellTracker {
-	return &cellTracker{
-		inflight:   make(map[string]int),
+func newScopeTracker(maxPerCell int) *scopeTracker {
+	return &scopeTracker{
+		inflight:   make(map[ext.Scope]int),
 		maxPerCell: maxPerCell,
 	}
 }
 
-// acquire increments the cell's counter if under the limit.
-// Returns true if the slot was acquired, false if the cell is full.
-func (ct *cellTracker) acquire(cellID string) bool {
+// acquire increments a scope's counter if under the limit.
+// Returns true if the slot was acquired, false if the scoped cell is full.
+func (ct *scopeTracker) acquire(scope ext.Scope) bool {
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
-	if ct.inflight[cellID] >= ct.maxPerCell {
+	if ct.inflight[scope] >= ct.maxPerCell {
 		return false
 	}
-	ct.inflight[cellID]++
+	ct.inflight[scope]++
 	return true
 }
 
 // release decrements the cell's counter by one. Safe to call even if
 // the counter is already zero (clamps to zero).
-func (ct *cellTracker) release(cellID string) {
+func (ct *scopeTracker) release(scope ext.Scope) {
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
-	if ct.inflight[cellID] > 0 {
-		ct.inflight[cellID]--
+	if ct.inflight[scope] > 0 {
+		ct.inflight[scope]--
 	}
-	if ct.inflight[cellID] == 0 {
-		delete(ct.inflight, cellID)
+	if ct.inflight[scope] == 0 {
+		delete(ct.inflight, scope)
 	}
 }
 
-// dropCell zeroes the cell's counter. Used during per-cell teardown
+// drop zeroes the scoped cell's counter. Used during per-cell teardown
 // after all in-flight tasks have been cancelled.
-func (ct *cellTracker) dropCell(cellID string) {
+func (ct *scopeTracker) drop(scope ext.Scope) {
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
-	delete(ct.inflight, cellID)
+	delete(ct.inflight, scope)
 }
 
-// countForCell returns the current inflight count for the cell.
-func (ct *cellTracker) countForCell(cellID string) int {
+// count returns the current inflight count for the scoped cell.
+func (ct *scopeTracker) count(scope ext.Scope) int {
 	ct.mu.Lock()
 	defer ct.mu.Unlock()
-	return ct.inflight[cellID]
+	return ct.inflight[scope]
 }
 
 // =====================================================================
@@ -236,21 +377,25 @@ func (ct *cellTracker) countForCell(cellID string) int {
 // ---------------------------------------------------------------------
 
 type workerPool struct {
-	logger       *slog.Logger
-	client       *http.Client
-	guard        *ssrfguard.EgressGuard
+	logger        *slog.Logger
+	client        *http.Client
+	guard         *ssrfguard.EgressGuard
 	maxFetchBytes int64
-	nextID       atomic.Uint32
+	nextID        atomic.Uint32
 
 	sem            chan struct{}
 	maxConcurrency int
 	maxQueued      int
 
-	cells *cellTracker
+	scopes *scopeTracker
 
-	mu       sync.Mutex
-	inflight map[uint32]*inflightTask
-	results  map[uint32]*taskResult
+	mu          sync.Mutex
+	inflight    map[uint32]*inflightTask
+	results     map[uint32]*taskResult
+	idempotency map[scopedIdempotencyKey]idempotencyEntry
+	// scopesByRoutingID lets TeardownCell accept Pulp's backwards-compatible
+	// control identifier while still resolving a full scoped placement.
+	scopesByRoutingID map[string]ext.Scope
 
 	// Background cleanup
 	cleanupDone chan struct{}
@@ -301,19 +446,43 @@ func newWorkerPool(logger *slog.Logger, maxConcurrency, maxQueued, maxPerCell in
 				return guard.CheckScheme(req)
 			},
 		},
-		guard:         guard,
-		maxFetchBytes: maxFetchBytes,
-		sem:            make(chan struct{}, maxConcurrency),
-		maxConcurrency: maxConcurrency,
-		maxQueued:      maxQueued,
-		cells:          newCellTracker(maxPerCell),
-		inflight:       make(map[uint32]*inflightTask),
-		results:        make(map[uint32]*taskResult),
-		cleanupDone:    make(chan struct{}),
-		cleanupStop:    cancel,
+		guard:             guard,
+		maxFetchBytes:     maxFetchBytes,
+		sem:               make(chan struct{}, maxConcurrency),
+		maxConcurrency:    maxConcurrency,
+		maxQueued:         maxQueued,
+		scopes:            newScopeTracker(maxPerCell),
+		inflight:          make(map[uint32]*inflightTask),
+		results:           make(map[uint32]*taskResult),
+		idempotency:       make(map[scopedIdempotencyKey]idempotencyEntry),
+		scopesByRoutingID: make(map[string]ext.Scope),
+		cleanupDone:       make(chan struct{}),
+		cleanupStop:       cancel,
 	}
 	go p.cleanupLoop(ctx)
 	return p
+}
+
+func (p *workerPool) registerScope(scope ext.Scope) {
+	p.mu.Lock()
+	p.scopesByRoutingID[scope.RoutingID()] = scope
+	// Legacy Pulp control paths still send Cell.Name(). New scoped cells use
+	// the injective RoutingID so equal names in sibling applications remain
+	// unambiguous.
+	if scope == ext.LegacyScope(scope.CellID()) {
+		p.scopesByRoutingID[scope.CellID()] = scope
+	}
+	p.mu.Unlock()
+}
+
+func (p *workerPool) scopeForTeardown(cellID string) ext.Scope {
+	p.mu.Lock()
+	scope, ok := p.scopesByRoutingID[cellID]
+	p.mu.Unlock()
+	if ok {
+		return scope
+	}
+	return ext.LegacyScope(cellID)
 }
 
 // inflightCount returns total inflight (running + queued results not yet reaped).
@@ -330,13 +499,42 @@ func (p *workerPool) inflightCount() int {
 const firstTaskID = 100
 
 // submit queues a task and returns (id, code). On success code == codeOK.
-// cellID identifies the owning cell for per-cell teardown; empty is fine
-// in single-cell deployments.
-func (p *workerPool) submit(cellID string, req taskRequest) (uint32, uint32) {
-	if p.inflightCount() >= p.maxQueued {
+// scope identifies the owning application/instance/cell for teardown,
+// scheduling quotas, results, and idempotency. ext.LegacyScope preserves the
+// existing single-app cell-name behavior for callers that need it.
+func (p *workerPool) submit(scope ext.Scope, req taskRequest) (uint32, uint32) {
+	fingerprint := requestFingerprint(req)
+	idempotencyKey := strings.TrimSpace(req.IdempotencyKey)
+
+	p.mu.Lock()
+	if idempotencyKey != "" {
+		key := scopedIdempotencyKey{scope: scope, key: idempotencyKey}
+		if existing, ok := p.idempotency[key]; ok {
+			if existing.fingerprint != fingerprint {
+				p.mu.Unlock()
+				return 0, codeIdempotencyConflict
+			}
+			if !existing.completed.IsZero() {
+				// workers_result may already have consumed the original result.
+				// Rehydrate it from the scoped idempotency receipt for this retry.
+				p.results[existing.id] = &taskResult{
+					data:           append([]byte(nil), existing.data...),
+					status:         existing.status,
+					completed:      existing.completed,
+					scope:          scope,
+					idempotencyKey: idempotencyKey,
+				}
+			}
+			p.mu.Unlock()
+			return existing.id, codeOK
+		}
+	}
+	if len(p.inflight) >= p.maxQueued {
+		p.mu.Unlock()
 		return 0, codeQueueFull
 	}
-	if cellID != "" && !p.cells.acquire(cellID) {
+	if !p.scopes.acquire(scope) {
+		p.mu.Unlock()
 		return 0, codeCellFull
 	}
 
@@ -349,10 +547,11 @@ func (p *workerPool) submit(cellID string, req taskRequest) (uint32, uint32) {
 		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	task := &inflightTask{cancel: cancel, done: make(chan struct{}), cellID: cellID}
-
-	p.mu.Lock()
+	task := &inflightTask{cancel: cancel, done: make(chan struct{}), scope: scope, idempotencyKey: idempotencyKey}
 	p.inflight[id] = task
+	if idempotencyKey != "" {
+		p.idempotency[scopedIdempotencyKey{scope: scope, key: idempotencyKey}] = idempotencyEntry{id: id, fingerprint: fingerprint}
+	}
 	p.mu.Unlock()
 
 	select {
@@ -362,95 +561,92 @@ func (p *workerPool) submit(cellID string, req taskRequest) (uint32, uint32) {
 		// WASM host import returns rather than blocking the caller indefinitely.
 		p.mu.Lock()
 		delete(p.inflight, id)
+		if idempotencyKey != "" {
+			delete(p.idempotency, scopedIdempotencyKey{scope: scope, key: idempotencyKey})
+		}
 		p.mu.Unlock()
 		task.cancel()
-		if cellID != "" {
-			p.cells.release(cellID)
-		}
+		p.scopes.release(scope)
 		return 0, codeSaturated
 	}
 	go func() {
 		defer func() {
 			<-p.sem
-			if cellID != "" {
-				p.cells.release(cellID)
-			}
+			p.scopes.release(scope)
 			close(task.done)
 		}()
 		defer func() {
 			if r := recover(); r != nil {
-				p.logger.Error("worker task panicked", "id", id, "cell", cellID, "type", req.Type, "panic", r)
-				p.mu.Lock()
-				delete(p.inflight, id)
-				p.results[id] = &taskResult{
-					data:      []byte(fmt.Sprintf("panic: %v", r)),
-					status:    statusPanic,
-					completed: time.Now(),
-					cellID:    cellID,
-				}
-				p.mu.Unlock()
+				p.logger.Error("worker task panicked", append([]any{"id", id, "type", req.Type, "panic", r}, scopeLogAttrs(scope)...)...)
+				p.storeResult(id, scope, idempotencyKey, []byte(fmt.Sprintf("panic: %v", r)), statusPanic)
 			}
 		}()
 
 		data, err := p.runTask(ctx, req)
 
-		p.mu.Lock()
-		delete(p.inflight, id)
 		if err != nil {
-			p.results[id] = &taskResult{
-				data:      []byte(err.Error()),
-				status:    statusError,
-				completed: time.Now(),
-				cellID:    cellID,
-			}
+			p.storeResult(id, scope, idempotencyKey, []byte(err.Error()), statusError)
 		} else {
-			p.results[id] = &taskResult{
-				data:      data,
-				status:    statusComplete,
-				completed: time.Now(),
-				cellID:    cellID,
-			}
+			p.storeResult(id, scope, idempotencyKey, data, statusComplete)
 		}
-		p.mu.Unlock()
 	}()
 
 	return id, codeOK
 }
 
+func (p *workerPool) storeResult(id uint32, scope ext.Scope, idempotencyKey string, data []byte, status uint32) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.inflight, id)
+	completed := time.Now()
+	p.results[id] = &taskResult{
+		data:           data,
+		status:         status,
+		completed:      completed,
+		scope:          scope,
+		idempotencyKey: idempotencyKey,
+	}
+	if idempotencyKey != "" {
+		key := scopedIdempotencyKey{scope: scope, key: idempotencyKey}
+		if receipt, ok := p.idempotency[key]; ok && receipt.id == id {
+			receipt.completed = completed
+			receipt.data = append([]byte(nil), data...)
+			receipt.status = status
+			p.idempotency[key] = receipt
+		}
+	}
+}
+
 // submitFire runs a task without tracking results. Returns host code.
-func (p *workerPool) submitFire(cellID string, req taskRequest) uint32 {
+func (p *workerPool) submitFire(scope ext.Scope, req taskRequest) uint32 {
 	if p.inflightCount() >= p.maxQueued {
 		return codeQueueFull
 	}
-	if cellID != "" && !p.cells.acquire(cellID) {
+	if !p.scopes.acquire(scope) {
 		return codeCellFull
 	}
 
 	select {
 	case p.sem <- struct{}{}:
 	default:
-		if cellID != "" {
-			p.cells.release(cellID)
-		}
+		p.scopes.release(scope)
 		return codeSaturated
 	}
 	go func() {
 		defer func() {
 			<-p.sem
-			if cellID != "" {
-				p.cells.release(cellID)
-			}
+			p.scopes.release(scope)
 		}()
 		defer func() {
 			if r := recover(); r != nil {
-				p.logger.Error("fire-and-forget task panicked", "cell", cellID, "type", req.Type, "panic", r)
+				p.logger.Error("fire-and-forget task panicked", append([]any{"type", req.Type, "panic", r}, scopeLogAttrs(scope)...)...)
 			}
 		}()
 
 		ctx, cancel := context.WithTimeout(context.Background(), maxFetchTimeout)
 		defer cancel()
 		if _, err := p.runTask(ctx, req); err != nil {
-			p.logger.Warn("fire-and-forget task failed", "cell", cellID, "type", req.Type, "err", err)
+			p.logger.Warn("fire-and-forget task failed", append([]any{"type", req.Type, "err", err}, scopeLogAttrs(scope)...)...)
 		}
 	}()
 	return codeOK
@@ -461,27 +657,28 @@ func (p *workerPool) submitFire(cellID string, req taskRequest) uint32 {
 // statusError or statusPanic the data is a raw UTF-8 error string —
 // the cell-side wrapper surfaces it via TaskResult.Error.
 //
-// cellID scopes ownership: a cell may only poll its OWN tasks. Task IDs are
+// scope scopes ownership: an application/cell instance may only poll its OWN
+// tasks. Task IDs are
 // a global, sequential, enumerable counter, so without this check a hostile
 // sibling could sweep IDs and steal (and delete) another cell's result. A
 // mismatch is reported as statusUnknown — indistinguishable from a
-// never-submitted ID, leaking nothing. Single-cell deployments (cellID=="")
-// own the matching "" tasks, so they are unaffected.
+// never-submitted ID, leaking nothing. Legacy single-cell deployments retain
+// their stable legacy/default/<cell>/default scope.
 // result peeks at the completed result for id without removing it from the
-// map. The caller must call consume(id) after successfully writing the data
+// map. The caller must call consume(scope, id) after successfully writing the data
 // into WASM memory so that a failed alloc never silently drops the result.
-func (p *workerPool) result(cellID string, id uint32) ([]byte, uint32) {
+func (p *workerPool) result(scope ext.Scope, id uint32) ([]byte, uint32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if r, ok := p.results[id]; ok {
-		if r.cellID != cellID {
+		if r.scope != scope {
 			return nil, statusUnknown
 		}
 		return r.data, r.status
 	}
 	if t, ok := p.inflight[id]; ok {
-		if t.cellID != cellID {
+		if t.scope != scope {
 			return nil, statusUnknown
 		}
 		return nil, statusPending
@@ -492,20 +689,25 @@ func (p *workerPool) result(cellID string, id uint32) ([]byte, uint32) {
 // consume removes the completed result for id from the map. Must be called
 // only after the WASM memory write succeeds; leaving the result in the map
 // until then lets the cell retry if alloc fails.
-func (p *workerPool) consume(id uint32) {
+func (p *workerPool) consume(scope ext.Scope, id uint32) bool {
 	p.mu.Lock()
+	defer p.mu.Unlock()
+	r, ok := p.results[id]
+	if !ok || r.scope != scope {
+		return false
+	}
 	delete(p.results, id)
-	p.mu.Unlock()
+	return true
 }
 
-// cancel attempts to cancel an in-flight task owned by cellID. A cell may
+// cancel attempts to cancel an in-flight task owned by scope. A cell may
 // only cancel its OWN tasks — a cross-cell cancel would be a DoS against a
 // sibling's in-flight work. A mismatch (or missing id) returns 1 (not
 // found), same as an already-done task.
-func (p *workerPool) cancel(cellID string, id uint32) uint32 {
+func (p *workerPool) cancel(scope ext.Scope, id uint32) uint32 {
 	p.mu.Lock()
 	task, ok := p.inflight[id]
-	if ok && task.cellID != cellID {
+	if ok && task.scope != scope {
 		ok = false
 	}
 	p.mu.Unlock()
@@ -550,23 +752,71 @@ func (p *workerPool) teardown() {
 	}
 }
 
-// teardownCell cancels in-flight tasks owned by cellID, waits up to
+func sameApplication(scope, application ext.Scope) bool {
+	return scope.ApplicationID() == application.ApplicationID() &&
+		scope.ApplicationInstanceID() == application.ApplicationInstanceID()
+}
+
+// teardownApplication releases all cell-instance records that belong to one
+// application setup scope. The underlying semaphore and transport stay alive
+// while another application still owns the shared pool.
+func (p *workerPool) teardownApplication(application ext.Scope) (int, int) {
+	p.mu.Lock()
+	scopes := make(map[ext.Scope]struct{})
+	for _, task := range p.inflight {
+		if sameApplication(task.scope, application) {
+			scopes[task.scope] = struct{}{}
+		}
+	}
+	for _, result := range p.results {
+		if sameApplication(result.scope, application) {
+			scopes[result.scope] = struct{}{}
+		}
+	}
+	for key := range p.idempotency {
+		if sameApplication(key.scope, application) {
+			scopes[key.scope] = struct{}{}
+		}
+	}
+	for routingID, scope := range p.scopesByRoutingID {
+		if sameApplication(scope, application) {
+			scopes[scope] = struct{}{}
+			delete(p.scopesByRoutingID, routingID)
+		}
+	}
+	p.mu.Unlock()
+
+	cancelled, dropped := 0, 0
+	for scope := range scopes {
+		c, d := p.teardownScope(scope)
+		cancelled += c
+		dropped += d
+	}
+	return cancelled, dropped
+}
+
+// teardownScope cancels in-flight tasks owned by scope, waits up to
 // teardownGrace for them to exit, and drops any completed-but-unpolled
 // results belonging to that cell. Other cells' state is left untouched.
 // Returns (cancelled, results) counts for logging.
-func (p *workerPool) teardownCell(cellID string) (int, int) {
+func (p *workerPool) teardownScope(scope ext.Scope) (int, int) {
 	p.mu.Lock()
 	tasks := make([]*inflightTask, 0)
 	for _, t := range p.inflight {
-		if t.cellID == cellID {
+		if t.scope == scope {
 			tasks = append(tasks, t)
 		}
 	}
 	resultsDropped := 0
 	for id, r := range p.results {
-		if r.cellID == cellID {
+		if r.scope == scope {
 			delete(p.results, id)
 			resultsDropped++
+		}
+	}
+	for key := range p.idempotency {
+		if key.scope == scope {
+			delete(p.idempotency, key)
 		}
 	}
 	p.mu.Unlock()
@@ -584,14 +834,14 @@ func (p *workerPool) teardownCell(cellID string) (int, int) {
 			// Drop the entire cell counter — those goroutines will
 			// call release() when they eventually exit, and release()
 			// clamps to zero so the extra decrements are harmless.
-			p.cells.dropCell(cellID)
+			p.scopes.drop(scope)
 			return len(tasks), resultsDropped
 		}
 	}
 
 	// All tasks exited cleanly; their defers already called release().
 	// Drop any residual counter (shouldn't be needed, but defensive).
-	p.cells.dropCell(cellID)
+	p.scopes.drop(scope)
 	return len(tasks), resultsDropped
 }
 
@@ -610,6 +860,11 @@ func (p *workerPool) cleanupLoop(ctx context.Context) {
 			for id, r := range p.results {
 				if now.Sub(r.completed) > resultTTL {
 					delete(p.results, id)
+				}
+			}
+			for key, receipt := range p.idempotency {
+				if !receipt.completed.IsZero() && now.Sub(receipt.completed) > resultTTL {
+					delete(p.idempotency, key)
 				}
 			}
 			p.mu.Unlock()
@@ -749,19 +1004,40 @@ func workersSetup(env ext.SetupEnv) error {
 		maxPerCell = readPositiveIntEnv("PULP_WORKER_MAX_PER_CELL", defaultMaxPerCell)
 	}
 	maxFetchBytes := readPositiveInt64Env("PULP_WORKERS_MAX_FETCH_BYTES", defaultMaxFetchBytes)
-	pool = newWorkerPool(logger, maxConcurrency, maxQueued, maxPerCell, maxFetchBytes)
-	logger.Info("workers extension initialized",
-		"max_concurrency", maxConcurrency,
-		"max_queued", maxQueued,
-		"max_per_cell", maxPerCell,
-		"max_fetch_bytes", maxFetchBytes,
-	)
+	_, created := setupSharedWorkerPool(env, func() *workerPool {
+		return newWorkerPool(logger, maxConcurrency, maxQueued, maxPerCell, maxFetchBytes)
+	})
+	if created {
+		logger.Info("workers extension initialized",
+			"max_concurrency", maxConcurrency,
+			"max_queued", maxQueued,
+			"max_per_cell", maxPerCell,
+			"max_fetch_bytes", maxFetchBytes,
+		)
+	} else {
+		logger.Info("workers extension attached application scope",
+			append(scopeLogAttrs(env.EffectiveScope()), "shared_pool", true)...,
+		)
+	}
 	return nil
 }
 
-func workersTeardown(_ context.Context) error {
-	if pool != nil {
-		pool.teardown()
+func workersTeardownScope(_ context.Context, scope ext.Scope) error {
+	if err := scope.Validate(); err != nil {
+		return fmt.Errorf("workers: teardown scope: %w", err)
+	}
+	p, lastOwner, owned := teardownSharedWorkerPool(scope)
+	if !owned || p == nil {
+		return nil
+	}
+	cancelled, dropped := p.teardownApplication(scope)
+	if lastOwner {
+		p.teardown()
+	}
+	if cancelled > 0 || dropped > 0 {
+		p.logger.Info("workers teardown application",
+			append(scopeLogAttrs(scope), "cancelled", cancelled, "dropped_results", dropped, "last_owner", lastOwner)...,
+		)
 	}
 	return nil
 }
@@ -770,13 +1046,16 @@ func workersTeardown(_ context.Context) error {
 // shuts down a single cell. Cancels that cell's in-flight tasks and
 // purges any completed results the cell never polled.
 func workersTeardownCell(_ context.Context, cellID string) error {
-	if pool == nil {
+	p := sharedWorkerPool()
+	if p == nil {
 		return nil
 	}
-	cancelled, dropped := pool.teardownCell(cellID)
+	scope := p.scopeForTeardown(cellID)
+	cancelled, dropped := p.teardownScope(scope)
 	if cancelled > 0 || dropped > 0 {
-		pool.logger.Info("workers teardown_cell",
+		p.logger.Info("workers teardown_cell",
 			"cell", cellID,
+			"routing_id", scope.RoutingID(),
 			"cancelled", cancelled,
 			"dropped_results", dropped,
 		)
@@ -789,12 +1068,14 @@ func workersTeardownCell(_ context.Context, cellID string) error {
 // =====================================================================
 
 func workersRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
-	// Capture cell identity in the closure so per-cell teardown can
-	// cancel only this cell's tasks without disturbing others.
-	cellID := ""
-	if cell != nil {
-		cellID = cell.Name()
+	// Capture an immutable full placement scope in every import closure. The
+	// extension binary and worker pool are shared, while work ownership is not.
+	scope := ext.ScopeOf(cell)
+	p := sharedWorkerPool()
+	if p == nil {
+		return workersStub(b, cell)
 	}
+	p.registerScope(scope)
 
 	// workers_submit(req_ptr, req_len) -> task_id_or_code:uint32
 	// On success returns the task id (>0). On failure returns a host error code
@@ -813,7 +1094,7 @@ func workersRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if err := msgpack.Unmarshal(data, &req); err != nil {
 				return codeDecode
 			}
-			id, code := pool.submit(cellID, req)
+			id, code := p.submit(scope, req)
 			if code != codeOK {
 				return code
 			}
@@ -835,14 +1116,14 @@ func workersRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if err := msgpack.Unmarshal(data, &req); err != nil {
 				return codeDecode
 			}
-			return pool.submitFire(cellID, req)
+			return p.submitFire(scope, req)
 		}).
 		Export("workers_submit_fire")
 
 	// workers_result(task_id, result_ptr_out, result_len_out) -> status:uint32
 	b.NewFunctionBuilder().
 		WithFunc(func(ctx context.Context, m api.Module, taskID, resultPtrOut, resultLenOut uint32) uint32 {
-			data, status := pool.result(cellID, taskID)
+			data, status := p.result(scope, taskID)
 			if status == statusPending || status == statusUnknown {
 				return status
 			}
@@ -850,7 +1131,7 @@ func workersRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			// Write data into WASM memory via pulp_alloc.
 			if len(data) == 0 {
 				// Nothing to write; consume before returning so the slot is freed.
-				pool.consume(taskID)
+				p.consume(scope, taskID)
 				if !m.Memory().WriteUint32Le(resultPtrOut, 0) {
 					return status
 				}
@@ -880,7 +1161,7 @@ func workersRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 				return status
 			}
 			// Write succeeded — now safe to consume the result.
-			pool.consume(taskID)
+			p.consume(scope, taskID)
 			if !m.Memory().WriteUint32Le(resultPtrOut, ptr) {
 				return status
 			}
@@ -894,14 +1175,14 @@ func workersRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 	// workers_cancel(task_id) -> error_code:uint32
 	b.NewFunctionBuilder().
 		WithFunc(func(_ context.Context, _ api.Module, taskID uint32) uint32 {
-			return pool.cancel(cellID, taskID)
+			return p.cancel(scope, taskID)
 		}).
 		Export("workers_cancel")
 
 	// workers_pending() -> count:uint32
 	b.NewFunctionBuilder().
 		WithFunc(func(_ context.Context, _ api.Module) uint32 {
-			return pool.pending()
+			return p.pending()
 		}).
 		Export("workers_pending")
 
