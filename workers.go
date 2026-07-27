@@ -171,6 +171,7 @@ func workersStorageRoot(scope ext.Scope) (string, bool) {
 func init() {
 	ext.Register(ext.Capability{
 		Name:          "workers",
+		Provider:      "github.com/BananaLabs-OSS/Pulp-ext-workers",
 		Register:      workersRegister,
 		Stub:          workersStub,
 		Setup:         workersSetup,

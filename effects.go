@@ -61,6 +61,11 @@ type EffectStore interface {
 // reduced to a generic non-secret failure before it reaches the state owner.
 type EffectHandler func(ctx context.Context, intent effect.Intent) (result msgpack.RawMessage, failure *effect.Failure, err error)
 
+// effectIntentValidator narrows one executor to its host-owned effect family.
+// It is intentionally internal plumbing: a capability supplies a fixed
+// validator when it constructs an executor, never guest-selected policy.
+type effectIntentValidator func(scope ext.Scope, intent *effect.Intent) error
+
 // EffectWorker is the scoped worker queue boundary. It accepts a closure so
 // the worker extension stays independent of email providers and tests can use
 // a deterministic fake queue.
@@ -74,13 +79,18 @@ type EffectWorker interface {
 // canonical Fiber v1 Intent; SubmitWire is the explicit compatibility path
 // that decodes and normalizes supported legacy aliases before persistence.
 type EffectExecutor struct {
-	store   EffectStore
-	worker  EffectWorker
-	handler EffectHandler
-	mu      sync.Mutex
+	store    EffectStore
+	worker   EffectWorker
+	handler  EffectHandler
+	validate effectIntentValidator
+	mu       sync.Mutex
 }
 
 func NewEffectExecutor(store EffectStore, worker EffectWorker, handler EffectHandler) (*EffectExecutor, error) {
+	return newValidatedEffectExecutor(store, worker, handler, normalizeAndValidateEffect)
+}
+
+func newValidatedEffectExecutor(store EffectStore, worker EffectWorker, handler EffectHandler, validate effectIntentValidator) (*EffectExecutor, error) {
 	if store == nil {
 		return nil, fmt.Errorf("%w: store is required", ErrEffectInvalid)
 	}
@@ -90,7 +100,10 @@ func NewEffectExecutor(store EffectStore, worker EffectWorker, handler EffectHan
 	if handler == nil {
 		return nil, fmt.Errorf("%w: handler is required", ErrEffectInvalid)
 	}
-	return &EffectExecutor{store: store, worker: worker, handler: handler}, nil
+	if validate == nil {
+		return nil, fmt.Errorf("%w: intent validator is required", ErrEffectInvalid)
+	}
+	return &EffectExecutor{store: store, worker: worker, handler: handler, validate: validate}, nil
 }
 
 // NewHostEffectExecutor binds an executor to the extension's already-created
@@ -111,7 +124,10 @@ func (e *EffectExecutor) Submit(ctx context.Context, scope ext.Scope, intent eff
 	if e == nil {
 		return EffectReceipt{}, fmt.Errorf("%w: executor is nil", ErrEffectInvalid)
 	}
-	if err := normalizeAndValidateEffect(scope, &intent); err != nil {
+	if e.validate == nil {
+		return EffectReceipt{}, fmt.Errorf("%w: intent validator is required", ErrEffectInvalid)
+	}
+	if err := e.validate(scope, &intent); err != nil {
 		return EffectReceipt{}, err
 	}
 	fingerprint := effectFingerprint(intent)

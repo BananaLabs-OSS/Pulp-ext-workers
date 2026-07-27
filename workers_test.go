@@ -16,6 +16,28 @@ import (
 	"github.com/BananaLabs-OSS/Pulp/ssrfguard"
 )
 
+func TestCapabilityRegistrationsCarryProviderIdentity(t *testing.T) {
+	const provider = "github.com/BananaLabs-OSS/Pulp-ext-workers"
+	want := map[string]bool{
+		"workers":              false,
+		StatusSignalCapability: false,
+	}
+	for _, capability := range ext.All() {
+		if _, ok := want[capability.Name]; !ok {
+			continue
+		}
+		if capability.Provider != provider {
+			t.Fatalf("%s provider = %q, want %q", capability.Name, capability.Provider, provider)
+		}
+		want[capability.Name] = true
+	}
+	for name, found := range want {
+		if !found {
+			t.Fatalf("%s capability is not registered", name)
+		}
+	}
+}
+
 // newTestPool builds a pool with the given egress allowlist, bypassing the
 // env-derived guard. Passing "" yields a default deny-all-private guard (no
 // seed hosts) so the SSRF block paths can be exercised against a loopback

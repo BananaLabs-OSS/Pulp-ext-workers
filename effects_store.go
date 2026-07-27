@@ -46,13 +46,21 @@ type durableEffectRecord struct {
 // root must be the host-provided application storage root, never an ambient
 // working directory; that keeps two applications from sharing durable state.
 func NewFileEffectStore(root string, scope ext.Scope) (*FileEffectStore, error) {
+	return newFileEffectStore(root, scope, "workers-notification-effect")
+}
+
+// newFileEffectStore retains one durable receipt file per effect family and
+// scope. Families must use distinct resource types: sharing one file between
+// independent stores would let two mutexes overwrite each other's receipts.
+// Notification remains on its original resource type for compatibility.
+func newFileEffectStore(root string, scope ext.Scope, resourceType string) (*FileEffectStore, error) {
 	if err := scope.Validate(); err != nil {
 		return nil, fmt.Errorf("workers effect store: scope: %w", err)
 	}
 	if root == "" {
 		return nil, errors.New("workers effect store: storage root is required")
 	}
-	key, err := scope.ResourceKey("workers-notification-effect", "receipt-store")
+	key, err := scope.ResourceKey(resourceType, "receipt-store")
 	if err != nil {
 		return nil, fmt.Errorf("workers effect store: resource key: %w", err)
 	}
