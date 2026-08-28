@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -16,17 +17,31 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 )
 
-const durableEffectStoreVersion = 1
+const (
+	durableEffectStoreVersion = 1
+
+	// Terminal receipts bridge the short interval between host completion and
+	// owner acknowledgement. They must survive a restart, but retaining them
+	// forever makes every Put rewrite an ever-growing snapshot. Status signals
+	// are high-frequency and expire quickly; notification receipts get a much
+	// longer replay window. Pending receipts are never pruned.
+	notificationReceiptRetention = 30 * 24 * time.Hour
+	notificationReceiptLimit     = 10_000
+	statusSignalReceiptRetention = time.Hour
+	statusSignalReceiptLimit     = 1_024
+)
 
 // FileEffectStore is a scope-owned, durable receipt store. It is deliberately
 // separate from an owner's business outbox: the outbox remains authoritative
 // for acknowledgement, while this store prevents a host restart from losing a
 // completed provider receipt before that acknowledgement lands.
 type FileEffectStore struct {
-	mu       sync.Mutex
-	scope    ext.Scope
-	path     string
-	receipts map[string]durableEffectRecord
+	mu            sync.Mutex
+	scope         ext.Scope
+	path          string
+	receipts      map[string]durableEffectRecord
+	retention     time.Duration
+	terminalLimit int
 }
 
 type durableEffectFile struct {
@@ -70,9 +85,15 @@ func newFileEffectStore(root string, scope ext.Scope, resourceType string) (*Fil
 		return nil, fmt.Errorf("workers effect store: create directory: %w", err)
 	}
 	store := &FileEffectStore{
-		scope:    scope,
-		path:     filepath.Join(dir, hex.EncodeToString(digest[:])+".msgpack"),
-		receipts: make(map[string]durableEffectRecord),
+		scope:         scope,
+		path:          filepath.Join(dir, hex.EncodeToString(digest[:])+".msgpack"),
+		receipts:      make(map[string]durableEffectRecord),
+		retention:     notificationReceiptRetention,
+		terminalLimit: notificationReceiptLimit,
+	}
+	if resourceType == statusSignalEffectResourceType {
+		store.retention = statusSignalReceiptRetention
+		store.terminalLimit = statusSignalReceiptLimit
 	}
 	if err := store.load(); err != nil {
 		return nil, err
@@ -149,6 +170,7 @@ func (s *FileEffectStore) load() error {
 }
 
 func (s *FileEffectStore) persistLocked() error {
+	s.pruneTerminalLocked(time.Now().UTC())
 	file := durableEffectFile{Version: durableEffectStoreVersion, Receipts: make(map[string]durableEffectRecord, len(s.receipts))}
 	for key, record := range s.receipts {
 		file.Receipts[key] = durableEffectRecord{
@@ -185,6 +207,37 @@ func (s *FileEffectStore) persistLocked() error {
 		return fmt.Errorf("workers effect store: replace: %w", err)
 	}
 	return nil
+}
+
+func (s *FileEffectStore) pruneTerminalLocked(now time.Time) {
+	type terminalRecord struct {
+		key       string
+		updatedAt int64
+	}
+	terminal := make([]terminalRecord, 0, len(s.receipts))
+	cutoff := now.Add(-s.retention).UnixNano()
+	for key, record := range s.receipts {
+		if record.Receipt.Status == effect.Pending {
+			continue
+		}
+		if s.retention > 0 && record.UpdatedAt < cutoff {
+			delete(s.receipts, key)
+			continue
+		}
+		terminal = append(terminal, terminalRecord{key: key, updatedAt: record.UpdatedAt})
+	}
+	if s.terminalLimit <= 0 || len(terminal) <= s.terminalLimit {
+		return
+	}
+	sort.Slice(terminal, func(i, j int) bool {
+		if terminal[i].updatedAt == terminal[j].updatedAt {
+			return terminal[i].key < terminal[j].key
+		}
+		return terminal[i].updatedAt < terminal[j].updatedAt
+	})
+	for _, record := range terminal[:len(terminal)-s.terminalLimit] {
+		delete(s.receipts, record.key)
+	}
 }
 
 func effectReceiptFromRecord(scope ext.Scope, record durableEffectRecord) EffectReceipt {
