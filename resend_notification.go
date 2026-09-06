@@ -98,16 +98,30 @@ func NewResendNotificationEmailDelivery(scope ext.Scope, config ResendNotificati
 // durable-store guarantees of ScopedNotificationEffectExecutorFactory while
 // keeping provider configuration outside the extension.
 func NewResendScopedNotificationEffectExecutorFactory(configSource ResendNotificationEmailConfigSource) (*ScopedNotificationEffectExecutorFactory, error) {
+	return NewResendScopedNotificationEffectExecutorFactoryWithStorage(configSource, func(scope ext.Scope) (string, error) {
+		root, ok := workersStorageRoot(scope)
+		if !ok {
+			return "", errors.New("workers notification effects: application storage root is unavailable")
+		}
+		return root, nil
+	})
+}
+
+func NewResendScopedNotificationEffectExecutorFactoryWithStorage(configSource ResendNotificationEmailConfigSource, storageRoot NotificationEffectStorageRoot) (*ScopedNotificationEffectExecutorFactory, error) {
 	if configSource == nil {
 		return nil, errors.New("workers resend: config source is required")
 	}
-	return NewScopedNotificationEffectExecutorFactory(func(scope ext.Scope) (NotificationEmailDelivery, error) {
+	return NewScopedNotificationEffectExecutorFactoryWithStorage(func(scope ext.Scope) (NotificationEmailDelivery, error) {
 		config, err := configSource(scope)
 		if err != nil {
 			return nil, fmt.Errorf("workers resend: provider config: %w", err)
 		}
-		return NewResendNotificationEmailDelivery(scope, config)
-	})
+		p := sharedWorkerPool()
+		if p == nil {
+			return nil, errors.New("workers resend: worker pool is unavailable")
+		}
+		return newResendNotificationEmailDelivery(config, pooledResendHTTPWorker{pool: p})
+	}, storageRoot)
 }
 
 func newResendNotificationEmailDelivery(config ResendNotificationEmailConfig, worker resendHTTPWorker) (*ResendNotificationEmailDelivery, error) {

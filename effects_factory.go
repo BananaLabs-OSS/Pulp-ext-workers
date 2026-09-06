@@ -34,29 +34,45 @@ func (f NotificationEmailDeliveryFunc) DeliverNotificationEmail(ctx context.Cont
 // configuration; the effect dispatcher will then retain and retry the outbox
 // record rather than silently acknowledging an undelivered email.
 type NotificationEmailHandlerFactory func(ext.Scope) (NotificationEmailDelivery, error)
+type NotificationEffectStorageRoot func(ext.Scope) (string, error)
 
 // ScopedNotificationEffectExecutorFactory constructs one durable executor per
-// application/cell instance. Its store root comes only from that application's
-// SetupEnv, and its delivery adapter is explicit and host-owned. There is no
+// application/cell instance. Its store root comes from an explicit host-owned
+// resolver (SetupEnv by default), and its delivery adapter is host-owned. There is no
 // MemoryEffectStore or default sender on this production path.
 type ScopedNotificationEffectExecutorFactory struct {
 	mu             sync.Mutex
 	handlerFactory NotificationEmailHandlerFactory
+	storageRoot    NotificationEffectStorageRoot
 	executors      map[ext.ResourceKey]*EffectExecutor
 }
 
 func NewScopedNotificationEffectExecutorFactory(handlerFactory NotificationEmailHandlerFactory) (*ScopedNotificationEffectExecutorFactory, error) {
+	return NewScopedNotificationEffectExecutorFactoryWithStorage(handlerFactory, func(scope ext.Scope) (string, error) {
+		root, ok := workersStorageRoot(scope)
+		if !ok {
+			return "", errors.New("workers notification effects: application storage root is unavailable")
+		}
+		return root, nil
+	})
+}
+
+func NewScopedNotificationEffectExecutorFactoryWithStorage(handlerFactory NotificationEmailHandlerFactory, storageRoot NotificationEffectStorageRoot) (*ScopedNotificationEffectExecutorFactory, error) {
 	if handlerFactory == nil {
 		return nil, errors.New("workers notification effects: handler factory is required")
 	}
+	if storageRoot == nil {
+		return nil, errors.New("workers notification effects: storage root source is required")
+	}
 	return &ScopedNotificationEffectExecutorFactory{
 		handlerFactory: handlerFactory,
+		storageRoot:    storageRoot,
 		executors:      make(map[ext.ResourceKey]*EffectExecutor),
 	}, nil
 }
 
 func (f *ScopedNotificationEffectExecutorFactory) ForScope(scope ext.Scope) (*EffectExecutor, error) {
-	if f == nil || f.handlerFactory == nil {
+	if f == nil || f.handlerFactory == nil || f.storageRoot == nil {
 		return nil, errors.New("workers notification effects: factory is not configured")
 	}
 	key, err := scope.ResourceKey("workers-notification-effect", "executor")
@@ -68,9 +84,9 @@ func (f *ScopedNotificationEffectExecutorFactory) ForScope(scope ext.Scope) (*Ef
 	if executor := f.executors[key]; executor != nil {
 		return executor, nil
 	}
-	storageRoot, ok := workersStorageRoot(scope)
-	if !ok {
-		return nil, errors.New("workers notification effects: application storage root is unavailable")
+	storageRoot, err := f.storageRoot(scope)
+	if err != nil {
+		return nil, err
 	}
 	store, err := NewFileEffectStore(storageRoot, scope)
 	if err != nil {
