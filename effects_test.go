@@ -158,8 +158,8 @@ func TestEffectExecutor_CanonicalWireAndLegacyAlias(t *testing.T) {
 	executor := newEffectExecutor(t, store, worker, func(_ context.Context, _ effect.Intent) (msgpack.RawMessage, *effect.Failure, error) {
 		return receiptResult(t, map[string]bool{"sent": true}), nil, nil
 	})
-	scope := scopedTestScope(t, "sessions", "green", "commerce", "one")
-	intent := emailIntent(t, "effect-7", "order-7:email", "sessions.notification.extension.ready.v1")
+	scope := scopedTestScope(t, "example", "green", "commerce", "one")
+	intent := emailIntent(t, "effect-7", "order-7:email", "workers.email.send")
 
 	wire, err := effect.MarshalIntent(effect.Intent{
 		Version: intent.Version, ID: intent.ID, Kind: effect.KindNotificationEmailSend,
@@ -383,5 +383,38 @@ func TestScopedNotificationEffectFactory_FailsClosedWithoutRuntimeOrHandler(t *t
 	}
 	if _, err := NewScopedNotificationEffectExecutorFactory(nil); err == nil {
 		t.Fatal("factory accepted nil handler source")
+	}
+	if _, err := NewScopedNotificationEffectExecutorFactoryWithStorage(func(ext.Scope) (NotificationEmailDelivery, error) {
+		return nil, errors.New("unused")
+	}, nil); err == nil {
+		t.Fatal("factory accepted nil storage root source")
+	}
+}
+
+func TestScopedNotificationEffectFactory_ExplicitHostStorageWithoutWorkersSetup(t *testing.T) {
+	resetSharedWorkerPoolForTest(t)
+	host := scopedTestScope(t, "evolution", "default", "host", "primary")
+	if err := workersSetup(ext.SetupEnv{Scope: host, StorageRoot: t.TempDir(), Logger: slog.Default()}); err != nil {
+		t.Fatalf("initialize shared host worker pool: %v", err)
+	}
+	cell := scopedTestScope(t, "sessions", "standalone", "notification-outbox-sqlite", "primary")
+	storageRoot := t.TempDir()
+	var resolved ext.Scope
+	factory, err := NewScopedNotificationEffectExecutorFactoryWithStorage(func(ext.Scope) (NotificationEmailDelivery, error) {
+		return NotificationEmailDeliveryFunc(func(context.Context, effect.Intent) (msgpack.RawMessage, *effect.Failure, error) {
+			return receiptResult(t, map[string]bool{"sent": true}), nil, nil
+		}), nil
+	}, func(scope ext.Scope) (string, error) {
+		resolved = scope
+		return storageRoot, nil
+	})
+	if err != nil {
+		t.Fatalf("new explicit-storage factory: %v", err)
+	}
+	if _, err := factory.ForScope(cell); err != nil {
+		t.Fatalf("explicit storage rejected standalone scope: %v", err)
+	}
+	if resolved != cell {
+		t.Fatalf("storage resolver scope = %#v, want %#v", resolved, cell)
 	}
 }
