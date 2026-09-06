@@ -79,11 +79,12 @@ type EffectWorker interface {
 // canonical Fiber v1 Intent; SubmitWire is the explicit compatibility path
 // that decodes and normalizes supported legacy aliases before persistence.
 type EffectExecutor struct {
-	store    EffectStore
-	worker   EffectWorker
-	handler  EffectHandler
-	validate effectIntentValidator
-	mu       sync.Mutex
+	store     EffectStore
+	worker    EffectWorker
+	handler   EffectHandler
+	validate  effectIntentValidator
+	scheduled map[scopedIdempotencyKey]struct{}
+	mu        sync.Mutex
 }
 
 func NewEffectExecutor(store EffectStore, worker EffectWorker, handler EffectHandler) (*EffectExecutor, error) {
@@ -103,7 +104,7 @@ func newValidatedEffectExecutor(store EffectStore, worker EffectWorker, handler 
 	if validate == nil {
 		return nil, fmt.Errorf("%w: intent validator is required", ErrEffectInvalid)
 	}
-	return &EffectExecutor{store: store, worker: worker, handler: handler, validate: validate}, nil
+	return &EffectExecutor{store: store, worker: worker, handler: handler, validate: validate, scheduled: make(map[scopedIdempotencyKey]struct{})}, nil
 }
 
 // NewHostEffectExecutor binds an executor to the extension's already-created
@@ -131,6 +132,7 @@ func (e *EffectExecutor) Submit(ctx context.Context, scope ext.Scope, intent eff
 		return EffectReceipt{}, err
 	}
 	fingerprint := effectFingerprint(intent)
+	scheduledKey := scopedIdempotencyKey{scope: scope, key: intent.IdempotencyKey}
 
 	e.mu.Lock()
 	receipt, found, err := e.store.Get(ctx, scope, intent.IdempotencyKey)
@@ -143,18 +145,28 @@ func (e *EffectExecutor) Submit(ctx context.Context, scope ext.Scope, intent eff
 			e.mu.Unlock()
 			return EffectReceipt{}, ErrEffectConflict
 		}
-		if receipt.Status != effect.Failed {
+		if receipt.Status == effect.Completed {
 			e.mu.Unlock()
 			return cloneReceipt(receipt), nil
 		}
-		pending, err := effect.NewPendingReceipt(intent)
-		if err != nil {
-			e.mu.Unlock()
-			return EffectReceipt{}, fmt.Errorf("build retry effect receipt: %w", err)
+		if receipt.Status == effect.Pending {
+			if _, active := e.scheduled[scheduledKey]; active {
+				e.mu.Unlock()
+				return cloneReceipt(receipt), nil
+			}
+			// A durable pending receipt without an in-process job was recovered
+			// after restart. Requeue the same immutable intent and stable key.
 		}
-		receipt.Intent = cloneIntent(intent)
-		receipt.Receipt = pending
-		receipt.UpdatedAt = time.Now().UTC()
+		if receipt.Status == effect.Failed {
+			pending, err := effect.NewPendingReceipt(intent)
+			if err != nil {
+				e.mu.Unlock()
+				return EffectReceipt{}, fmt.Errorf("build retry effect receipt: %w", err)
+			}
+			receipt.Intent = cloneIntent(intent)
+			receipt.Receipt = pending
+			receipt.UpdatedAt = time.Now().UTC()
+		}
 	} else {
 		pending, err := effect.NewPendingReceipt(intent)
 		if err != nil {
@@ -175,6 +187,7 @@ func (e *EffectExecutor) Submit(ctx context.Context, scope ext.Scope, intent eff
 		e.mu.Unlock()
 		return EffectReceipt{}, fmt.Errorf("persist pending host effect receipt: %w", err)
 	}
+	e.scheduled[scheduledKey] = struct{}{}
 	e.mu.Unlock()
 
 	if err := e.worker.Submit(ctx, scope, func(runCtx context.Context) {
@@ -230,6 +243,7 @@ func (e *EffectExecutor) Receipt(ctx context.Context, scope ext.Scope, idempoten
 func (e *EffectExecutor) finish(scope ext.Scope, intent effect.Intent, fingerprint [sha256.Size]byte, result msgpack.RawMessage, failure *effect.Failure, runErr error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	delete(e.scheduled, scopedIdempotencyKey{scope: scope, key: intent.IdempotencyKey})
 
 	receipt, found, err := e.store.Get(context.Background(), scope, intent.IdempotencyKey)
 	if err != nil || !found || receipt.Scope != scope || receipt.Fingerprint != fingerprint || receipt.Status != effect.Pending {
