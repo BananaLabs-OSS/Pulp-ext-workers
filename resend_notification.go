@@ -76,15 +76,14 @@ func (w pooledResendHTTPWorker) Fetch(ctx context.Context, request taskRequest) 
 	return w.pool.doHTTPFetch(ctx, request)
 }
 
-// NewResendNotificationEmailDelivery constructs an explicit, scope-bound
-// provider adapter. A configured scoped workers runtime must already exist;
-// this prevents a deployment from falling back to an unscoped HTTP client.
+// NewResendNotificationEmailDelivery constructs an explicit, scope-validated
+// provider adapter. The shared Workers runtime must already exist; durable
+// receipt storage is supplied separately by the scoped executor factory, so
+// deployments with an explicit storage resolver do not need to register a
+// second ambient storage root for every owner cell.
 func NewResendNotificationEmailDelivery(scope ext.Scope, config ResendNotificationEmailConfig) (*ResendNotificationEmailDelivery, error) {
 	if err := scope.Validate(); err != nil {
 		return nil, fmt.Errorf("workers resend: scope: %w", err)
-	}
-	if _, ok := workersStorageRoot(scope); !ok {
-		return nil, errors.New("workers resend: scoped workers runtime is unavailable")
 	}
 	p := sharedWorkerPool()
 	if p == nil {
