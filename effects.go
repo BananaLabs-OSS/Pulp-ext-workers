@@ -330,7 +330,7 @@ func cloneCanonicalReceipt(receipt effect.Receipt) effect.Receipt {
 
 type pooledEffectWorker struct{ pool *workerPool }
 
-func (w pooledEffectWorker) Submit(_ context.Context, scope ext.Scope, run func(context.Context)) error {
+func (w pooledEffectWorker) Submit(ctx context.Context, scope ext.Scope, run func(context.Context)) error {
 	if w.pool == nil {
 		return errors.New("workers: extension is not initialized")
 	}
@@ -339,9 +339,9 @@ func (w pooledEffectWorker) Submit(_ context.Context, scope ext.Scope, run func(
 	}
 	select {
 	case w.pool.sem <- struct{}{}:
-	default:
+	case <-ctx.Done():
 		w.pool.scopes.release(scope)
-		return ErrWorkerSaturated
+		return ctx.Err()
 	}
 	go func() {
 		defer func() {
