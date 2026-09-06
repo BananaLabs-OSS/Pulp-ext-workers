@@ -237,6 +237,37 @@ func TestEffectExecutor_FailedIntentCanRetryWithSameStableKey(t *testing.T) {
 	}
 }
 
+func TestEffectExecutor_RecoversDurablePendingReceiptAfterRestart(t *testing.T) {
+	store := NewMemoryEffectStore()
+	firstWorker := &fakeEffectWorker{}
+	scope := scopedTestScope(t, "sessions", "green", "identity", "one")
+	intent := emailIntent(t, "effect-recovered", "verify-recovered:email", effect.KindNotificationEmailSend)
+	first := newEffectExecutor(t, store, firstWorker, func(context.Context, effect.Intent) (msgpack.RawMessage, *effect.Failure, error) {
+		t.Fatal("job from stopped process must not run")
+		return nil, nil, nil
+	})
+	if receipt, err := first.Submit(context.Background(), scope, intent); err != nil || receipt.Status != effect.Pending || firstWorker.count() != 1 {
+		t.Fatalf("initial pending = (%+v, %v), jobs=%d", receipt, err, firstWorker.count())
+	}
+
+	secondWorker := &fakeEffectWorker{}
+	second := newEffectExecutor(t, store, secondWorker, func(context.Context, effect.Intent) (msgpack.RawMessage, *effect.Failure, error) {
+		return receiptResult(t, map[string]bool{"delivered": true}), nil, nil
+	})
+	recovered, err := second.Submit(context.Background(), scope, intent)
+	if err != nil || recovered.Status != effect.Pending || secondWorker.count() != 1 {
+		t.Fatalf("recovered pending = (%+v, %v), jobs=%d", recovered, err, secondWorker.count())
+	}
+	if _, err := second.Submit(context.Background(), scope, intent); err != nil || secondWorker.count() != 1 {
+		t.Fatalf("in-process pending replay scheduled duplicate: err=%v jobs=%d", err, secondWorker.count())
+	}
+	secondWorker.runNext(t)
+	completed, err := second.Receipt(context.Background(), scope, intent.IdempotencyKey)
+	if err != nil || completed.Status != effect.Completed {
+		t.Fatalf("recovered completion = (%+v, %v)", completed, err)
+	}
+}
+
 func TestEffectExecutor_QueueFailurePersistsGenericFailure(t *testing.T) {
 	store := NewMemoryEffectStore()
 	worker := &fakeEffectWorker{err: errors.New("queue saturated")}
