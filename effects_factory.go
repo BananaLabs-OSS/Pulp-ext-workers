@@ -44,6 +44,7 @@ type ScopedNotificationEffectExecutorFactory struct {
 	mu             sync.Mutex
 	handlerFactory NotificationEmailHandlerFactory
 	storageRoot    NotificationEffectStorageRoot
+	storeFactory   EffectStoreFactory
 	executors      map[ext.ResourceKey]*EffectExecutor
 }
 
@@ -71,8 +72,20 @@ func NewScopedNotificationEffectExecutorFactoryWithStorage(handlerFactory Notifi
 	}, nil
 }
 
+// NewScopedNotificationEffectExecutorFactoryWithStore binds production to a
+// host-owned durable store without exposing database configuration to cells.
+func NewScopedNotificationEffectExecutorFactoryWithStore(handlerFactory NotificationEmailHandlerFactory, storeFactory EffectStoreFactory) (*ScopedNotificationEffectExecutorFactory, error) {
+	if handlerFactory == nil {
+		return nil, errors.New("workers notification effects: handler factory is required")
+	}
+	if storeFactory == nil {
+		return nil, errors.New("workers notification effects: store factory is required")
+	}
+	return &ScopedNotificationEffectExecutorFactory{handlerFactory: handlerFactory, storeFactory: storeFactory, executors: make(map[ext.ResourceKey]*EffectExecutor)}, nil
+}
+
 func (f *ScopedNotificationEffectExecutorFactory) ForScope(scope ext.Scope) (*EffectExecutor, error) {
-	if f == nil || f.handlerFactory == nil || f.storageRoot == nil {
+	if f == nil || f.handlerFactory == nil || (f.storageRoot == nil && f.storeFactory == nil) {
 		return nil, errors.New("workers notification effects: factory is not configured")
 	}
 	key, err := scope.ResourceKey("workers-notification-effect", "executor")
@@ -84,13 +97,21 @@ func (f *ScopedNotificationEffectExecutorFactory) ForScope(scope ext.Scope) (*Ef
 	if executor := f.executors[key]; executor != nil {
 		return executor, nil
 	}
-	storageRoot, err := f.storageRoot(scope)
+	var store EffectStore
+	if f.storeFactory != nil {
+		store, err = f.storeFactory(scope, "workers-notification-effect")
+	} else {
+		var storageRoot string
+		storageRoot, err = f.storageRoot(scope)
+		if err == nil {
+			store, err = NewFileEffectStore(storageRoot, scope)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
-	store, err := NewFileEffectStore(storageRoot, scope)
-	if err != nil {
-		return nil, err
+	if store == nil {
+		return nil, errors.New("workers notification effects: effect store is nil")
 	}
 	delivery, err := f.handlerFactory(scope)
 	if err != nil {

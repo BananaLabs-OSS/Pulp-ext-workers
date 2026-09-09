@@ -57,9 +57,31 @@ type StatusSignalScopeConfigSource func(ext.Scope) (StatusSignalScopeConfig, err
 // host scope, so equal packages in different applications never share a token
 // or receipt namespace.
 type ScopedStatusSignalEffectExecutorFactory struct {
-	mu        sync.Mutex
-	config    StatusSignalScopeConfigSource
-	executors map[ext.ResourceKey]*EffectExecutor
+	mu           sync.Mutex
+	config       StatusSignalScopeConfigSource
+	storeFactory EffectStoreFactory
+	executors    map[ext.ResourceKey]*EffectExecutor
+}
+
+// SetStoreFactory changes only subsequently constructed executors. Deployment
+// calls this during initialization, before any application can submit work.
+func (f *ScopedStatusSignalEffectExecutorFactory) SetStoreFactory(storeFactory EffectStoreFactory) error {
+	if f == nil || storeFactory == nil {
+		return errors.New("workers status signals: store factory is required")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.executors) != 0 {
+		return errors.New("workers status signals: store factory cannot change after use")
+	}
+	f.storeFactory = storeFactory
+	return nil
+}
+
+// ConfigureStatusSignalEffectStore installs the production receipt backend.
+// Local hosts that do not call it retain the file-backed store.
+func ConfigureStatusSignalEffectStore(storeFactory EffectStoreFactory) error {
+	return hostStatusSignalExecutors.SetStoreFactory(storeFactory)
 }
 
 func NewScopedStatusSignalEffectExecutorFactory(config StatusSignalScopeConfigSource) (*ScopedStatusSignalEffectExecutorFactory, error) {
@@ -93,9 +115,17 @@ func (f *ScopedStatusSignalEffectExecutorFactory) ForScope(scope ext.Scope) (*Ef
 	if err := config.Validate(); err != nil {
 		return nil, err
 	}
-	store, err := newFileEffectStore(runtime.storageRoot, scope, statusSignalEffectResourceType)
+	var store EffectStore
+	if f.storeFactory != nil {
+		store, err = f.storeFactory(scope, statusSignalEffectResourceType)
+	} else {
+		store, err = newFileEffectStore(runtime.storageRoot, scope, statusSignalEffectResourceType)
+	}
 	if err != nil {
 		return nil, err
+	}
+	if store == nil {
+		return nil, errors.New("workers status signals: effect store is nil")
 	}
 	handler := EffectHandler(func(ctx context.Context, intent effect.Intent) (msgpack.RawMessage, *effect.Failure, error) {
 		return publishStatusSignalHTTP(ctx, runtime.pool, config, intent)

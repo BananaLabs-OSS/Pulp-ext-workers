@@ -2,7 +2,9 @@ package workersext
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sync"
@@ -55,6 +57,16 @@ type EffectStore interface {
 	Put(ctx context.Context, receipt EffectReceipt) error
 }
 
+// FencedEffectStore is the additive multi-process protocol used by durable
+// production stores. Claim grants one expiring execution lease; Finish accepts
+// a terminal receipt only from the current fence. File and memory stores keep
+// the original single-process interface for local compatibility.
+type FencedEffectStore interface {
+	EffectStore
+	Claim(ctx context.Context, scope ext.Scope, idempotencyKey string, fingerprint [sha256.Size]byte, claimant string, now time.Time, leaseDuration time.Duration) (fence uint64, claimed bool, err error)
+	Finish(ctx context.Context, receipt EffectReceipt, claimant string, fence uint64) (settled bool, err error)
+}
+
 // EffectHandler owns the privileged implementation (for example, email
 // delivery). Result must be a kind-owned MessagePack value. A handler should
 // return a stable Failure for an expected provider error; an ordinary error is
@@ -83,6 +95,7 @@ type EffectExecutor struct {
 	worker    EffectWorker
 	handler   EffectHandler
 	validate  effectIntentValidator
+	claimant  string
 	scheduled map[scopedIdempotencyKey]struct{}
 	mu        sync.Mutex
 }
@@ -104,7 +117,11 @@ func newValidatedEffectExecutor(store EffectStore, worker EffectWorker, handler 
 	if validate == nil {
 		return nil, fmt.Errorf("%w: intent validator is required", ErrEffectInvalid)
 	}
-	return &EffectExecutor{store: store, worker: worker, handler: handler, validate: validate, scheduled: make(map[scopedIdempotencyKey]struct{})}, nil
+	claimantBytes := make([]byte, 16)
+	if _, err := rand.Read(claimantBytes); err != nil {
+		return nil, fmt.Errorf("%w: create worker identity: %v", ErrEffectInvalid, err)
+	}
+	return &EffectExecutor{store: store, worker: worker, handler: handler, validate: validate, claimant: hex.EncodeToString(claimantBytes), scheduled: make(map[scopedIdempotencyKey]struct{})}, nil
 }
 
 // NewHostEffectExecutor binds an executor to the extension's already-created
@@ -187,14 +204,26 @@ func (e *EffectExecutor) Submit(ctx context.Context, scope ext.Scope, intent eff
 		e.mu.Unlock()
 		return EffectReceipt{}, fmt.Errorf("persist pending host effect receipt: %w", err)
 	}
+	var fence uint64
+	if store, ok := e.store.(FencedEffectStore); ok {
+		fence, found, err = store.Claim(ctx, scope, intent.IdempotencyKey, fingerprint, e.claimant, time.Now().UTC(), 2*time.Minute)
+		if err != nil {
+			e.mu.Unlock()
+			return EffectReceipt{}, fmt.Errorf("claim host effect receipt: %w", err)
+		}
+		if !found {
+			e.mu.Unlock()
+			return cloneReceipt(receipt), nil
+		}
+	}
 	e.scheduled[scheduledKey] = struct{}{}
 	e.mu.Unlock()
 
 	if err := e.worker.Submit(ctx, scope, func(runCtx context.Context) {
 		result, failure, runErr := e.handler(runCtx, cloneIntent(intent))
-		e.finish(scope, intent, fingerprint, result, failure, runErr)
+		e.finish(scope, intent, fingerprint, fence, result, failure, runErr)
 	}); err != nil {
-		e.finish(scope, intent, fingerprint, nil, nil, err)
+		e.finish(scope, intent, fingerprint, fence, nil, nil, err)
 		failed, loadErr := e.Receipt(ctx, scope, intent.IdempotencyKey)
 		if loadErr != nil {
 			return EffectReceipt{}, fmt.Errorf("queue host effect: %w", err)
@@ -240,7 +269,7 @@ func (e *EffectExecutor) Receipt(ctx context.Context, scope ext.Scope, idempoten
 	return cloneReceipt(receipt), nil
 }
 
-func (e *EffectExecutor) finish(scope ext.Scope, intent effect.Intent, fingerprint [sha256.Size]byte, result msgpack.RawMessage, failure *effect.Failure, runErr error) {
+func (e *EffectExecutor) finish(scope ext.Scope, intent effect.Intent, fingerprint [sha256.Size]byte, fence uint64, result msgpack.RawMessage, failure *effect.Failure, runErr error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	delete(e.scheduled, scopedIdempotencyKey{scope: scope, key: intent.IdempotencyKey})
@@ -262,6 +291,10 @@ func (e *EffectExecutor) finish(scope ext.Scope, intent effect.Intent, fingerpri
 		receipt.Receipt, _ = effect.NewFailedReceipt(intent, *genericFailure("invalid_host_result", "host effect returned an invalid result"))
 	}
 	receipt.UpdatedAt = time.Now().UTC()
+	if store, ok := e.store.(FencedEffectStore); ok {
+		_, _ = store.Finish(context.Background(), receipt, e.claimant, fence)
+		return
+	}
 	_ = e.store.Put(context.Background(), receipt)
 }
 
