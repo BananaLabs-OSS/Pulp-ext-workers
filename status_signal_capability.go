@@ -122,9 +122,12 @@ func writeStatusSignalResponse(ctx context.Context, module api.Module, response 
 		return false
 	}
 	result, err := alloc.Call(ctx, uint64(len(response)))
-	if err != nil || len(result) == 0 || uint32(result[0]) == 0 {
+	if err != nil || len(result) == 0 || uint64(len(response)) > uint64(^uint32(0)) {
 		return false
 	}
-	ptr := uint32(result[0])
-	return module.Memory().Write(ptr, response) && module.Memory().WriteUint32Le(responsePtrPtr, ptr) && module.Memory().WriteUint32Le(responseLenPtr, uint32(len(response)))
+	ptr, ok := wasmUint32(result[0])
+	if !ok || ptr == 0 {
+		return false
+	}
+	return module.Memory().Write(ptr, response) && module.Memory().WriteUint32Le(responsePtrPtr, ptr) && module.Memory().WriteUint32Le(responseLenPtr, uint32(len(response))) // #nosec G115 -- bounded above.
 }

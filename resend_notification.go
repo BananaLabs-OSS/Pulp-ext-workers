@@ -182,7 +182,11 @@ func (d *ResendNotificationEmailDelivery) DeliverNotificationEmail(ctx context.C
 	if err != nil {
 		return nil, genericFailure("notification_encoding_failed", "notification could not be encoded"), nil
 	}
-	timeoutMS := uint32(d.config.Timeout.Milliseconds())
+	timeoutMillis := d.config.Timeout.Milliseconds()
+	if timeoutMillis < 0 || uint64(timeoutMillis) > uint64(^uint32(0)) {
+		return nil, genericFailure("invalid_notification_timeout", "notification timeout is outside the supported range"), nil
+	}
+	timeoutMS := uint32(timeoutMillis) // #nosec G115 -- bounded above.
 	data, err := d.http.Fetch(ctx, taskRequest{
 		Type: "http.fetch", Method: "POST", URL: d.config.Endpoint, Body: body, TimeoutMs: timeoutMS,
 		Headers: map[string]string{

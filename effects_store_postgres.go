@@ -315,12 +315,15 @@ func (s *PostgresEffectStore) Finish(ctx context.Context, incoming EffectReceipt
 	if err != nil {
 		return false, fmt.Errorf("workers postgres effect store: encode completion: %w", err)
 	}
+	if fence > uint64(^uint64(0)>>1) {
+		return false, errors.New("workers postgres effect store: fence exceeds database integer range")
+	}
 	result, err := s.database.ExecContext(ctx, `UPDATE `+postgresEffectReceiptTable+` SET
 		receipt_wire=$1, receipt_status=$2, updated_at=$3, claim_owner=NULL, claim_until=NULL
 		WHERE scope_routing_id=$4 AND effect_family=$5 AND idempotency_key=$6
 		AND fingerprint=$7 AND receipt_status='pending' AND claim_owner=$8 AND claim_fence=$9`,
 		receiptWire, string(incoming.Status), incoming.UpdatedAt, s.scope.RoutingID(), s.effectFamily,
-		incoming.Intent.IdempotencyKey, incoming.Fingerprint[:], claimant, int64(fence))
+		incoming.Intent.IdempotencyKey, incoming.Fingerprint[:], claimant, int64(fence)) // #nosec G115 -- bounded above.
 	if err != nil {
 		return false, fmt.Errorf("workers postgres effect store: finish receipt: %w", err)
 	}
