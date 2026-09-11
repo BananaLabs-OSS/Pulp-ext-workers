@@ -236,10 +236,10 @@ func requestFingerprint(req taskRequest) [sha256.Size]byte {
 	_, _ = h.Write(req.Body)
 	_, _ = h.Write([]byte{0})
 	var timeout [4]byte
-	timeout[0] = byte(req.TimeoutMs >> 24)
-	timeout[1] = byte(req.TimeoutMs >> 16)
-	timeout[2] = byte(req.TimeoutMs >> 8)
-	timeout[3] = byte(req.TimeoutMs)
+	timeout[0] = byte(req.TimeoutMs >> 24) // #nosec G115 -- intentional low-byte serialization.
+	timeout[1] = byte(req.TimeoutMs >> 16) // #nosec G115 -- intentional low-byte serialization.
+	timeout[2] = byte(req.TimeoutMs >> 8)  // #nosec G115 -- intentional low-byte serialization.
+	timeout[3] = byte(req.TimeoutMs)       // #nosec G115 -- intentional low-byte serialization.
 	_, _ = h.Write(timeout[:])
 	keys := make([]string, 0, len(req.Headers))
 	for key := range req.Headers {
@@ -724,7 +724,10 @@ func (p *workerPool) pending() uint32 {
 	p.mu.Lock()
 	n := len(p.inflight)
 	p.mu.Unlock()
-	return uint32(n)
+	if uint64(n) > uint64(^uint32(0)) {
+		return ^uint32(0)
+	}
+	return uint32(n) // #nosec G115 -- bounded above.
 }
 
 // teardown cancels all in-flight tasks and waits up to teardownGrace.
@@ -952,7 +955,7 @@ func (p *workerPool) doHTTPFetch(ctx context.Context, req taskRequest) ([]byte, 
 	}
 
 	result := abi.HTTPResponse{
-		Status:  uint32(resp.StatusCode),
+		Status:  uint32(resp.StatusCode), // #nosec G115 -- net/http status codes are bounded to three digits.
 		Headers: headers,
 		Body:    respBody,
 	}
@@ -1152,7 +1155,10 @@ func workersRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 				// Alloc failed; leave result in map so the cell can retry.
 				return status
 			}
-			ptr := uint32(results[0])
+			ptr, ok := wasmUint32(results[0])
+			if !ok || uint64(len(data)) > uint64(^uint32(0)) {
+				return status
+			}
 			if ptr == 0 {
 				// Alloc returned null; leave result in map so the cell can retry.
 				return status
@@ -1166,7 +1172,7 @@ func workersRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 			if !m.Memory().WriteUint32Le(resultPtrOut, ptr) {
 				return status
 			}
-			if !m.Memory().WriteUint32Le(resultLenOut, uint32(len(data))) {
+			if !m.Memory().WriteUint32Le(resultLenOut, uint32(len(data))) { // #nosec G115 -- bounded above.
 				return status
 			}
 			return status
@@ -1188,6 +1194,13 @@ func workersRegister(b wazero.HostModuleBuilder, cell ext.Cell) error {
 		Export("workers_pending")
 
 	return nil
+}
+
+func wasmUint32(value uint64) (uint32, bool) {
+	if value > uint64(^uint32(0)) {
+		return 0, false
+	}
+	return uint32(value), true
 }
 
 // =====================================================================

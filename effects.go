@@ -376,12 +376,13 @@ func (w pooledEffectWorker) Submit(ctx context.Context, scope ext.Scope, run fun
 		w.pool.scopes.release(scope)
 		return ctx.Err()
 	}
+	detached := context.WithoutCancel(ctx)
 	go func() {
 		defer func() {
 			<-w.pool.sem
 			w.pool.scopes.release(scope)
 		}()
-		run(context.Background())
+		run(detached)
 	}()
 	return nil
 }
